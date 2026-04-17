@@ -624,7 +624,7 @@ module RubyIndexer
       # The private_constant method does not resolve the constant name. It always points to a constant that needs to
       # exist in the current namespace
       entries = @index[fully_qualify_name(name)]
-      entries&.each { |entry| entry.visibility = :private }
+      entries&.each { |entry| @index.set_entry_visibility(entry, :private) }
     end
 
     #: (Prism::CallNode node) -> void
@@ -874,7 +874,7 @@ module RubyIndexer
           entry_owner_name = entry.owner_name
           next unless entry_owner_name
 
-          entry.visibility = :private
+          @index.set_entry_visibility(entry, :private)
 
           singleton = @index.existing_or_new_singleton_class(entry_owner_name)
           location = Location.from_prism_location(argument.location, @code_units_cache)
@@ -927,7 +927,7 @@ module RubyIndexer
         entries = @index.resolve_method(name, @index.existing_or_new_singleton_class(owner_name).name)
         next unless entries
 
-        entries.each { |entry| entry.visibility = :private }
+        entries.each { |entry| @index.set_entry_visibility(entry, :private) }
       end
     end
 
@@ -1059,7 +1059,7 @@ module RubyIndexer
         next unless entries
 
         entries.each do |entry|
-          entry.visibility = visibility
+          @index.set_entry_visibility(entry, visibility)
         end
       end
     end

@@ -78,51 +78,10 @@ if sqlite_store
   puts
 end
 
-# PrefixTree nodes (only workspace entries remain)
-node_count = 0
-node_size = 0
-ObjectSpace.each_object(RubyIndexer::PrefixTree::Node) do |node|
-  node_count += 1
-  node_size += ObjectSpace.memsize_of(node)
-end
-puts "=== PrefixTree (workspace only) ==="
-puts "  Node count: #{node_count}"
-puts "  Node size:  #{(node_size / 1024.0).round(1)} KB"
-puts
-
-# URI objects
-uri_count = 0
-uri_size = 0
-ObjectSpace.each_object(URI::Generic) do |uri|
-  uri_count += 1
-  uri_size += ObjectSpace.memsize_of(uri)
-end
-puts "=== URI::Generic Objects ==="
-puts "  Total URI objects: #{uri_count}"
-puts "  Total URI size:    #{(uri_size / 1024.0).round(1)} KB"
-puts
-
-# Location objects (only workspace entries remain)
-location_count = 0
-location_size = 0
-ObjectSpace.each_object(RubyIndexer::Location) do |loc|
-  location_count += 1
-  location_size += ObjectSpace.memsize_of(loc)
-end
-puts "=== Location Objects (workspace only) ==="
-puts "  Count: #{location_count}"
-puts "  Size:  #{(location_size / 1024.0).round(1)} KB"
-puts
-
-# Hash overhead
-entries_hash = index.instance_variable_get(:@entries)
-uris_hash = index.instance_variable_get(:@uris_to_entries)
+# Remaining in-memory objects
 ancestors_hash = index.instance_variable_get(:@ancestors)
-
-puts "=== In-Memory Hash Data Structures ==="
-puts "  @entries:          #{entries_hash.size} keys, #{(ObjectSpace.memsize_of(entries_hash) / 1024.0).round(1)} KB"
-puts "  @uris_to_entries:  #{uris_hash.size} keys, #{(ObjectSpace.memsize_of(uris_hash) / 1024.0).round(1)} KB"
-puts "  @ancestors:        #{ancestors_hash.size} keys, #{(ObjectSpace.memsize_of(ancestors_hash) / 1024.0).round(1)} KB"
+puts "=== In-Memory State ==="
+puts "  @ancestors cache:  #{ancestors_hash.size} keys, #{(ObjectSpace.memsize_of(ancestors_hash) / 1024.0).round(1)} KB"
 puts
 
 # Overall memory

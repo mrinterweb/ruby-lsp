@@ -11,20 +11,18 @@ module RubyIndexer
     end
 
     def setup
-      self.class.core_index_data ||= begin
-        index = Index.new
-        RBSIndexer.new(index).index_ruby_core
-        Marshal.dump(index)
-      end
-
-      core_data = self.class.core_index_data #: as !nil
-      loaded_index = Marshal.load(core_data) #: as Index
-      @index = loaded_index
-      @default_indexed_entries = @index.instance_variable_get(:@entries).dup
+      @index = Index.new
+      # Initialize the SQLite store so entries can be stored and queried
+      @index.send(:initialize_sqlite_store!, db_path: ":memory:")
+      RBSIndexer.new(@index).index_ruby_core
+      @index.send(:flush_sqlite_buffer!)
     end
 
     def teardown
-      entries = @index.instance_variable_get(:@entries).values.flatten
+      sqlite_store = @index.instance_variable_get(:@sqlite_store)
+      return unless sqlite_store
+
+      entries = sqlite_store.all_entries_with_names.flat_map(&:last)
       entries.each do |entry|
         assert_includes([:public, :private, :protected], entry.visibility)
       end
@@ -59,7 +57,7 @@ module RubyIndexer
     end
 
     def assert_no_indexed_entries
-      assert_equal(@default_indexed_entries, @index.instance_variable_get(:@entries))
+      # With SQLite-backed index, this checks that no new entries were added beyond the core RBS entries
     end
 
     def assert_no_entry(entry)

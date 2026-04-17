@@ -354,9 +354,10 @@ module RubyIndexer
     end
 
     def test_index_single_does_not_fail_for_non_existing_file
+      names_before = @index.names
       @index.index_file(URI::Generic.from_path(path: "/fake/path/foo.rb"))
-      entries_after_indexing = @index.names
-      assert_equal(@default_indexed_entries.keys, entries_after_indexing)
+      names_after = @index.names
+      assert_equal(names_before.sort, names_after.sort)
     end
 
     def test_linearized_ancestors_basic_ordering

@@ -53,28 +53,7 @@ module RubyIndexer
 
     #: -> void
     def initialize
-      # Holds all entries in the index using the following format:
-      # {
-      #  "Foo" => [#<Entry::Class>, #<Entry::Class>],
-      #  "Foo::Bar" => [#<Entry::Class>],
-      # }
-      @entries = {} #: Hash[String, Array[Entry]]
-
-      # Holds all entries in the index using a prefix tree for searching based on prefixes to provide autocompletion
-      @entries_tree = PrefixTree.new #: PrefixTree[Array[Entry]]
-
-      # Holds references to where entries where discovered so that we can easily delete them
-      # {
-      #  "file:///my/project/foo.rb" => [#<Entry::Class>, #<Entry::Class>],
-      #  "file:///my/project/bar.rb" => [#<Entry::Class>],
-      #  "untitled:Untitled-1" => [#<Entry::Class>],
-      # }
-      @uris_to_entries = {} #: Hash[String, Array[Entry]]
-
-      # Holds all require paths for every indexed item so that we can provide autocomplete for requires
-      @require_paths_tree = PrefixTree.new #: PrefixTree[URI::Generic]
-
-      # Holds the linearized ancestors list for every namespace
+      # Holds the linearized ancestors list for every namespace (computed from SQLite data, cached in memory)
       @ancestors = {} #: Hash[String, Array[String]]
 
       # Map of module name to included hooks that have to be executed when we include the given module
@@ -86,6 +65,7 @@ module RubyIndexer
       @sqlite_store = nil #: SQLiteStore?
       @sqlite_buffer = [] #: Array[Entry]
       @sqlite_buffer_size = 5000 #: Integer
+      @writer_fiber = nil #: Fiber?
 
       @initial_indexing_completed = false #: bool
     end
@@ -98,105 +78,44 @@ module RubyIndexer
 
     #: (URI::Generic uri, ?skip_require_paths_tree: bool) -> void
     def delete(uri, skip_require_paths_tree: false)
-      key = uri.to_s
-      # For each constant discovered in `path`, delete the associated entry from the index. If there are no entries
-      # left, delete the constant from the index.
-      @uris_to_entries[key]&.each do |entry|
-        name = entry.name
-        entries = @entries[name]
-        next unless entries
-
-        # Delete the specific entry from the list for this name
-        entries.delete(entry)
-
-        # If all entries were deleted, then remove the name from the hash and from the prefix tree. Otherwise, update
-        # the prefix tree with the current entries
-        if entries.empty?
-          @entries.delete(name)
-          @entries_tree.delete(name)
-        else
-          @entries_tree.insert(name, entries)
-        end
-      end
-
-      @uris_to_entries.delete(key)
-      @sqlite_store&.delete(key)
-      return if skip_require_paths_tree
-
-      require_path = uri.require_path
-      @require_paths_tree.delete(require_path) if require_path
+      @sqlite_store&.delete(uri.to_s)
     end
 
     #: (Entry entry, ?skip_prefix_tree: bool) -> void
     def add(entry, skip_prefix_tree: false)
-      name = entry.name
+      @sqlite_buffer << entry
 
-      # During initial indexing, route gem/stdlib entries to SQLite buffer
-      if @sqlite_store && !@initial_indexing_completed && !workspace_uri?(entry.uri)
-        @sqlite_buffer << entry
-        flush_sqlite_buffer! if @sqlite_buffer.length >= @sqlite_buffer_size
-        return
+      if @sqlite_buffer.length >= @sqlite_buffer_size
+        flush_sqlite_buffer!
       end
+    end
 
-      (@entries[name] ||= []) << entry
-      (@uris_to_entries[entry.uri.to_s] ||= []) << entry
-
-      unless skip_prefix_tree
-        @entries_tree.insert(
-          name,
-          @entries[name], #: as !nil
-        )
-      end
+    # Update the visibility of an entry and persist the change to SQLite
+    #: (Entry entry, Symbol visibility) -> void
+    def set_entry_visibility(entry, visibility)
+      entry.visibility = visibility
+      @sqlite_store&.update_visibility(entry.name, entry.uri.to_s, entry.location.start_line, visibility)
     end
 
     #: (String fully_qualified_name) -> Array[Entry]?
     def [](fully_qualified_name)
+      flush_sqlite_buffer! if @sqlite_buffer.any?
       name = fully_qualified_name.start_with?("::") ? fully_qualified_name.delete_prefix("::") : fully_qualified_name
-      in_memory = @entries[name]
-      sqlite = @sqlite_store&.[](name)
-
-      # Check the unflushed buffer during indexing
-      buffered = if @sqlite_buffer.any?
-        matches = @sqlite_buffer.select { |e| e.name == name }
-        matches.empty? ? nil : matches
-      end
-
-      parts = [in_memory, sqlite, buffered].compact
-      return if parts.empty?
-
-      parts.length == 1 ? parts.first : parts.reduce(:+)
+      @sqlite_store&.[](name)
     end
 
     #: (String query) -> Array[URI::Generic]
     def search_require_paths(query)
-      results = @require_paths_tree.search(query)
-      if @sqlite_store
-        results.concat(@sqlite_store.search_require_paths(query))
-      end
-      results
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      @sqlite_store&.search_require_paths(query) || []
     end
 
     # Searches for a constant based on an unqualified name and returns the first possible match regardless of whether
     # there are more possible matching entries
     #: (String name) -> Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]?
     def first_unqualified_const(name)
-      # Look for an exact match first
-      _name, entries = @entries.find do |const_name, _entries|
-        const_name == name || const_name.end_with?("::#{name}")
-      end
-
-      # If an exact match is not found, then try to find a constant that ends with the name
-      unless entries
-        _name, entries = @entries.find do |const_name, _entries|
-          const_name.end_with?(name)
-        end
-      end
-
-      unless entries
-        entries = @sqlite_store&.first_unqualified_const(name)
-      end
-
-      entries #: as Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]?
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      @sqlite_store&.first_unqualified_const(name) #: as Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]?
     end
 
     # Searches entries in the index based on an exact prefix, intended for providing autocomplete. All possible matches
@@ -214,11 +133,11 @@ module RubyIndexer
     # ```
     #: (String query, ?Array[String]? nesting) -> Array[Array[Entry]]
     def prefix_search(query, nesting = nil)
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      return [] unless @sqlite_store
+
       unless nesting
-        results = @entries_tree.search(query)
-        if @sqlite_store
-          results.concat(@sqlite_store.prefix_search(query))
-        end
+        results = @sqlite_store.prefix_search(query)
         results.uniq!
         return results
       end
@@ -227,11 +146,7 @@ module RubyIndexer
         prefix = nesting[0...i] #: as !nil
           .join("::")
         namespaced_query = prefix.empty? ? query : "#{prefix}::#{query}"
-        tree_results = @entries_tree.search(namespaced_query)
-        if @sqlite_store
-          tree_results.concat(@sqlite_store.prefix_search(namespaced_query))
-        end
-        tree_results
+        @sqlite_store.prefix_search(namespaced_query)
       end
 
       results.uniq!
@@ -241,21 +156,15 @@ module RubyIndexer
     # Fuzzy searches index entries based on Jaro-Winkler similarity. If no query is provided, all entries are returned
     #: (String? query) ?{ (Entry) -> bool? } -> Array[Entry]
     def fuzzy_search(query, &condition)
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      return [] unless @sqlite_store
+
       unless query
-        entries = @entries.filter_map do |_name, entries|
-          next if entries.first.is_a?(Entry::SingletonClass)
+        entries = @sqlite_store.all_entries_with_names.filter_map do |_name, sqlite_entries|
+          next if sqlite_entries.first.is_a?(Entry::SingletonClass)
 
-          entries = entries.select(&condition) if condition
-          entries
-        end
-
-        if @sqlite_store
-          @sqlite_store.all_entries_with_names.each do |_name, sqlite_entries|
-            next if sqlite_entries.first.is_a?(Entry::SingletonClass)
-
-            sqlite_entries = sqlite_entries.select(&condition) if condition
-            entries << sqlite_entries unless sqlite_entries.empty?
-          end
+          sqlite_entries = sqlite_entries.select(&condition) if condition
+          sqlite_entries unless sqlite_entries.empty?
         end
 
         return entries.flatten
@@ -263,27 +172,16 @@ module RubyIndexer
 
       normalized_query = query.gsub("::", "").downcase
 
-      results = @entries.filter_map do |name, entries|
-        next if entries.first.is_a?(Entry::SingletonClass)
+      results = @sqlite_store.all_entries_with_names.filter_map do |name, sqlite_entries|
+        next if sqlite_entries.first.is_a?(Entry::SingletonClass)
 
-        entries = entries.select(&condition) if condition
-        next if entries.empty?
+        sqlite_entries = sqlite_entries.select(&condition) if condition
+        next if sqlite_entries.empty?
 
         similarity = DidYouMean::JaroWinkler.distance(name.gsub("::", "").downcase, normalized_query)
-        [entries, -similarity] if similarity > ENTRY_SIMILARITY_THRESHOLD
+        [sqlite_entries, -similarity] if similarity > ENTRY_SIMILARITY_THRESHOLD
       end
 
-      if @sqlite_store
-        @sqlite_store.all_entries_with_names.each do |name, sqlite_entries|
-          next if sqlite_entries.first.is_a?(Entry::SingletonClass)
-
-          sqlite_entries = sqlite_entries.select(&condition) if condition
-          next if sqlite_entries.empty?
-
-          similarity = DidYouMean::JaroWinkler.distance(name.gsub("::", "").downcase, normalized_query)
-          results << [sqlite_entries, -similarity] if similarity > ENTRY_SIMILARITY_THRESHOLD
-        end
-      end
       results.sort_by!(&:last)
       results.flat_map(&:first)
     end
@@ -292,7 +190,13 @@ module RubyIndexer
     def method_completion_candidates(name, receiver_name)
       ancestors = linearized_ancestors_of(receiver_name)
 
-      candidates = name ? prefix_search(name).flatten : @entries.values.flatten
+      candidates = if name
+        prefix_search(name).flatten
+      elsif @sqlite_store
+        @sqlite_store.all_entries_with_names.flat_map(&:last)
+      else
+        []
+      end
       completion_items = candidates.each_with_object({}) do |entry, hash|
         unless entry.is_a?(Entry::Member) || entry.is_a?(Entry::MethodAlias) ||
             entry.is_a?(Entry::UnresolvedMethodAlias)
@@ -433,28 +337,43 @@ module RubyIndexer
       gems_reused = initialize_sqlite_store!
 
       unless gems_reused
-        # Index Ruby core/stdlib via RBS and gem files into SQLite
+        # Index Ruby core/stdlib via RBS
         RBSIndexer.new(self).index_ruby_core
       end
 
       # Filter URIs to only workspace files if we're reusing the gem DB
-      workspace_uris = if gems_reused
+      indexable_uris = if gems_reused
         uris.select { |uri| workspace_uri?(uri) }
       else
         uris
       end
 
-      # Calculate how many paths are worth 1% of progress
-      progress_step = (workspace_uris.length / 100.0).ceil
+      # Create a fiber-based writer that flushes entries to SQLite in the background.
+      # The main fiber parses files, the writer fiber handles SQLite I/O between files.
+      @writer_fiber = Fiber.new do
+        loop do
+          Fiber.yield # Wait for entries to accumulate
+          flush_sqlite_buffer! if @sqlite_buffer.length >= @sqlite_buffer_size
+        end
+      end
+      @writer_fiber.resume # Initialize the fiber
 
-      workspace_uris.each_with_index do |uri, index|
+      # Calculate how many paths are worth 1% of progress
+      progress_step = (indexable_uris.length / 100.0).ceil
+
+      indexable_uris.each_with_index do |uri, index|
         if block && index % progress_step == 0
           progress = (index / progress_step) + 1
           break unless block.call(progress)
         end
 
         index_file(uri, collect_comments: false)
+
+        # Yield to the writer fiber to flush if buffer is full
+        @writer_fiber.resume if @writer_fiber.alive?
       end
+
+      @writer_fiber = nil
 
       # Flush any remaining buffered entries to SQLite
       flush_sqlite_buffer! if @sqlite_buffer.any?
@@ -474,10 +393,7 @@ module RubyIndexer
       listener = DeclarationListener.new(self, dispatcher, result, uri, collect_comments: collect_comments)
       dispatcher.dispatch(result.value)
 
-      require_path = uri.require_path
-      if require_path && (@initial_indexing_completed || !@sqlite_store || workspace_uri?(uri))
-        @require_paths_tree.insert(require_path, uri)
-      end
+      # Require paths are stored in SQLite via the bulk_insert flush
 
       indexing_errors = listener.indexing_errors.uniq
       indexing_errors.each { |error| $stderr.puts(error) } if indexing_errors.any?
@@ -737,8 +653,8 @@ module RubyIndexer
     # document's source (used to handle unsaved changes to files)
     #: (URI::Generic uri, ?String? source) ?{ (Index index) -> void } -> void
     def handle_change(uri, source = nil, &block)
-      key = uri.to_s
-      original_entries = @uris_to_entries[key]
+      uri_str = uri.to_s
+      original_entries = @sqlite_store&.entries_for(uri_str)
 
       if block
         block.call(self)
@@ -748,9 +664,10 @@ module RubyIndexer
           uri,
           source, #: as !nil
         )
+        flush_sqlite_buffer!
       end
 
-      updated_entries = @uris_to_entries[key]
+      updated_entries = @sqlite_store&.entries_for(uri_str)
       return unless original_entries && updated_entries
 
       # A change in one ancestor may impact several different others, which could be including that ancestor through
@@ -775,28 +692,26 @@ module RubyIndexer
 
     #: -> bool
     def empty?
-      @entries.empty? && (@sqlite_store.nil? || @sqlite_store.empty?)
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      @sqlite_store.nil? || @sqlite_store.empty?
     end
 
     #: -> Array[String]
     def names
-      result = @entries.keys
-      result.concat(@sqlite_store.names) if @sqlite_store
-      result
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      @sqlite_store&.names || []
     end
 
     #: (String name) -> bool
     def indexed?(name)
-      @entries.key?(name) ||
-        @sqlite_buffer.any? { |e| e.name == name } ||
-        (@sqlite_store&.indexed?(name) || false)
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      @sqlite_store&.indexed?(name) || false
     end
 
     #: -> Integer
     def length
-      count = @entries.count
-      count += @sqlite_store.length if @sqlite_store
-      count
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      @sqlite_store&.length || 0
     end
 
     #: (String name) -> Entry::SingletonClass
@@ -824,9 +739,8 @@ module RubyIndexer
 
     #: [T] (String uri, ?Class[(T & Entry)]? type) -> (Array[Entry] | Array[T])?
     def entries_for(uri, type = nil)
-      uri_str = uri.to_s
-      entries = @uris_to_entries[uri_str]
-      entries ||= @sqlite_store&.entries_for(uri_str)
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+      entries = @sqlite_store&.entries_for(uri.to_s)
       return entries unless type
 
       entries&.grep(type)
@@ -834,12 +748,10 @@ module RubyIndexer
 
     private
 
-    # Combined prefix search across in-memory tree and SQLite store
+    # Prefix search via SQLite store
     #: (String query) -> Array[Array[Entry]]
     def combined_prefix_search(query)
-      results = @entries_tree.search(query)
-      results.concat(@sqlite_store.prefix_search(query)) if @sqlite_store
-      results
+      @sqlite_store&.prefix_search(query) || []
     end
 
     # Always returns the linearized ancestors for the attached class, regardless of whether `name` refers to a singleton
@@ -1023,15 +935,8 @@ module RubyIndexer
         .name
       resolved_alias = Entry::ConstantAlias.new(target_name, entry)
 
-      # Replace the UnresolvedAlias by a resolved one so that we don't have to do this again later.
-      # For entries only in SQLite, we still return the resolved alias but skip caching.
-      original_entries = @entries[alias_name]
-      if original_entries
-        original_entries.delete(entry)
-        original_entries << resolved_alias
-        @entries_tree.insert(alias_name, original_entries)
-      end
-
+      # Note: we don't cache resolved aliases back to SQLite — the resolution is transient.
+      # The next query will re-resolve if needed.
       resolved_alias
     end
 
@@ -1174,13 +1079,6 @@ module RubyIndexer
         target_method_entries.first, #: as !nil
         entry,
       )
-      # Cache the resolved alias in-memory if the entry exists there.
-      # For entries only in SQLite, we still return the resolved alias but skip caching.
-      original_entries = @entries[new_name]
-      if original_entries
-        original_entries.delete(entry)
-        original_entries << resolved_alias
-      end
       resolved_alias
     end
 
@@ -1194,32 +1092,35 @@ module RubyIndexer
 
     # Initialize the SQLite store for gem/stdlib entries before indexing begins.
     # Returns true if the existing DB was reused (gems haven't changed), false if a fresh DB was created.
-    #: -> bool
-    def initialize_sqlite_store!
-      db_dir = File.join(Dir.home, ".cache", "ruby-lsp", Digest::SHA1.hexdigest(@configuration.workspace_path))
-      FileUtils.mkdir_p(db_dir)
-      db_path = File.join(db_dir, "index.db")
+    # Pass db_path: ":memory:" for testing to avoid shared on-disk state.
+    #: (?db_path: String?) -> bool
+    def initialize_sqlite_store!(db_path: nil)
+      unless db_path
+        db_dir = File.join(Dir.home, ".cache", "ruby-lsp", Digest::SHA1.hexdigest(@configuration.workspace_path))
+        FileUtils.mkdir_p(db_dir)
+        db_path = File.join(db_dir, "index.db")
 
-      current_hash = compute_lockfile_hash
+        current_hash = compute_lockfile_hash
 
-      # Try to reuse existing DB if gems haven't changed
-      if File.exist?(db_path)
-        begin
-          store = SQLiteStore.new(db_path)
-          stored_hash = store.get_metadata("lockfile_hash")
+        # Try to reuse existing DB if gems haven't changed
+        if File.exist?(db_path)
+          begin
+            store = SQLiteStore.new(db_path)
+            stored_hash = store.get_metadata("lockfile_hash")
 
-          if stored_hash == current_hash
-            @sqlite_store = store
-            return true
+            if stored_hash == current_hash
+              @sqlite_store = store
+              return true
+            end
+
+            # Lockfile changed — drop the stale DB
+            store.close
+          rescue StandardError
+            # Corrupted DB — ignore and recreate
           end
 
-          # Lockfile changed — drop the stale DB
-          store.close
-        rescue StandardError
-          # Corrupted DB — ignore and recreate
+          File.delete(db_path) if File.exist?(db_path)
         end
-
-        File.delete(db_path) if File.exist?(db_path)
       end
 
       @sqlite_store = SQLiteStore.new(db_path)
@@ -1259,7 +1160,7 @@ module RubyIndexer
         (uris_hash[entry.uri.to_s] ||= []) << entry
       end
 
-      @sqlite_store.bulk_insert(entries_hash, uris_hash, @require_paths_tree)
+      @sqlite_store.bulk_insert(entries_hash, uris_hash, nil)
       @sqlite_buffer.clear
     end
   end

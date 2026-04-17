@@ -58,8 +58,8 @@ module RubyIndexer
       setup_schema
     end
 
-    #: (Hash[String, Array[Entry]] entries, Hash[String, Array[Entry]] uris_to_entries, PrefixTree[URI::Generic] require_paths_tree) -> void
-    def bulk_insert(entries, uris_to_entries, require_paths_tree)
+    #: (Hash[String, Array[Entry]] entries, Hash[String, Array[Entry]] uris_to_entries, untyped? _require_paths_tree) -> void
+    def bulk_insert(entries, uris_to_entries, _require_paths_tree = nil)
       @db.transaction do
         insert_entry = @db.prepare(<<~SQL)
           INSERT INTO entries (
@@ -194,6 +194,16 @@ module RubyIndexer
     #: -> bool
     def empty?
       length == 0
+    end
+
+    # Update the visibility of an entry in the database
+    #: (String name, String uri, Integer start_line, Symbol visibility) -> void
+    def update_visibility(name, uri, start_line, visibility)
+      vis_int = VISIBILITY_MAP[visibility] || 0
+      @db.execute(
+        "UPDATE entries SET visibility = ? WHERE name = ? AND uri = ? AND start_line = ?",
+        [vis_int, name, uri, start_line],
+      )
     end
 
     # Delete all entries for a URI

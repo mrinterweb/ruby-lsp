@@ -384,6 +384,7 @@ module RubyIndexer
       file_path = "/fake.rb"
       uri = URI::Generic.from_path(path: file_path)
       index = Index.new
+      index.send(:initialize_sqlite_store!, db_path: ":memory:")
       index.index_single(uri, source)
       parse_result = Prism.parse(source)
       dispatcher = Prism::Dispatcher.new

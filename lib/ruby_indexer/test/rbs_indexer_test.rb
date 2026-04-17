@@ -367,6 +367,7 @@ module RubyIndexer
       buffer = RBS::Buffer.new(content: rbs, name: "")
       _, _, declarations = RBS::Parser.parse_signature(buffer)
       index = RubyIndexer::Index.new
+      index.send(:initialize_sqlite_store!, db_path: ":memory:")
       indexer = RubyIndexer::RBSIndexer.new(index)
       pathname = Pathname.new("/file.rbs")
       indexer.process_signature(pathname, declarations)
