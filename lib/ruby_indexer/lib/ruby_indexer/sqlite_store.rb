@@ -47,6 +47,8 @@ module RubyIndexer
     #: SQLite3::Database
     attr_reader :db
 
+    SCHEMA_VERSION = 2 #: Integer
+
     #: (?String? db_path) -> void
     def initialize(db_path = nil)
       @db = SQLite3::Database.new(db_path || ":memory:")
@@ -55,6 +57,7 @@ module RubyIndexer
       @db.execute("PRAGMA synchronous=NORMAL")
       @db.execute("PRAGMA cache_size=-20000") # 20MB cache
       @uri_cache = {} #: Hash[String, URI::Generic]
+      migrate_if_needed
       setup_schema
     end
 
@@ -83,11 +86,11 @@ module RubyIndexer
         SQL
 
         insert_require_path = @db.prepare(<<~SQL)
-          INSERT OR IGNORE INTO require_paths (path, uri) VALUES (?, ?)
+          INSERT OR REPLACE INTO require_paths (path, uri) VALUES (?, ?)
         SQL
 
         # Track which namespace names we've already inserted mixins for
-        inserted_mixins = {} #: Hash[String, bool]
+        inserted_mixins = {} #: Hash[String, Integer]
 
         entries.each_value do |entry_list|
           entry_list.each do |entry|
@@ -242,6 +245,9 @@ module RubyIndexer
 
       # Delete entries (cascades to signatures and parameters)
       @db.execute("DELETE FROM entries WHERE uri = ?", [uri])
+
+      # Remove mtime tracking
+      @db.execute("DELETE FROM indexed_files WHERE uri = ?", [uri])
     end
 
     # Delete entries by name (used when moving an entry back to the in-memory buffer for mutation)
@@ -292,6 +298,19 @@ module RubyIndexer
       rows.group_by { |r| r["name"] }.map { |name, group| [name, materialize_entries(group)] }
     end
 
+    # Check if a file has already been indexed with the same mtime
+    #: (String uri, Integer mtime) -> bool
+    def file_up_to_date?(uri, mtime)
+      stored = @db.get_first_value("SELECT mtime FROM indexed_files WHERE uri = ?", [uri])
+      stored == mtime
+    end
+
+    # Record the mtime for an indexed file
+    #: (String uri, Integer mtime) -> void
+    def set_file_mtime(uri, mtime)
+      @db.execute("INSERT OR REPLACE INTO indexed_files (uri, mtime) VALUES (?, ?)", [uri, mtime])
+    end
+
     # Store a metadata key-value pair
     #: (String key, String value) -> void
     def set_metadata(key, value)
@@ -310,6 +329,23 @@ module RubyIndexer
     end
 
     private
+
+    # Drop all tables if schema version has changed, forcing a full rebuild
+    #: -> void
+    def migrate_if_needed
+      current = @db.get_first_value("SELECT value FROM metadata WHERE key = 'schema_version'") rescue nil
+      return if current.to_i == SCHEMA_VERSION
+
+      @db.execute_batch(<<~SQL)
+        DROP TABLE IF EXISTS parameters;
+        DROP TABLE IF EXISTS signatures;
+        DROP TABLE IF EXISTS mixin_operations;
+        DROP TABLE IF EXISTS require_paths;
+        DROP TABLE IF EXISTS indexed_files;
+        DROP TABLE IF EXISTS entries;
+        DROP TABLE IF EXISTS metadata;
+      SQL
+    end
 
     #: -> void
     def setup_schema
@@ -339,6 +375,11 @@ module RubyIndexer
         CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);
         CREATE INDEX IF NOT EXISTS idx_entries_uri ON entries(uri);
         CREATE INDEX IF NOT EXISTS idx_entries_owner ON entries(owner_name);
+
+        CREATE TABLE IF NOT EXISTS indexed_files (
+          uri TEXT PRIMARY KEY,
+          mtime INTEGER NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS signatures (
           id INTEGER PRIMARY KEY,
@@ -380,6 +421,8 @@ module RubyIndexer
 
         PRAGMA foreign_keys = ON;
       SQL
+
+      set_metadata("schema_version", SCHEMA_VERSION.to_s)
     end
 
     #: (SQLite3::Statement stmt, Entry entry) -> Integer

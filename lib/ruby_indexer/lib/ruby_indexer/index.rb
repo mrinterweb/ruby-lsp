@@ -361,10 +361,31 @@ module RubyIndexer
       # Calculate how many paths are worth 1% of progress
       progress_step = (indexable_uris.length / 100.0).ceil
 
+      indexed_file_uris = [] #: Array[[String, Integer]]
+
       indexable_uris.each_with_index do |uri, index|
         if block && index % progress_step == 0
           progress = (index / progress_step) + 1
           break unless block.call(progress)
+        end
+
+        # Skip files whose mtime hasn't changed since last indexing
+        path = uri.full_path
+        if path && @sqlite_store
+          begin
+            mtime = File.stat(path).mtime.to_i
+
+            if @sqlite_store.file_up_to_date?(uri.to_s, mtime)
+              next
+            end
+
+            # Delete stale entries for this file before re-indexing
+            @sqlite_store.delete(uri.to_s)
+            indexed_file_uris << [uri.to_s, mtime]
+          rescue Errno::ENOENT
+            # File was deleted between listing and indexing — skip
+            next
+          end
         end
 
         index_file(uri, collect_comments: false)
@@ -377,6 +398,9 @@ module RubyIndexer
 
       # Flush any remaining buffered entries to SQLite
       flush_sqlite_buffer! if @sqlite_buffer.any?
+
+      # Record mtimes for all files we indexed
+      indexed_file_uris.each { |uri_str, mtime| @sqlite_store&.set_file_mtime(uri_str, mtime) }
 
       # Store the current lockfile hash for future persistence checks
       @sqlite_store&.set_metadata("lockfile_hash", compute_lockfile_hash)
@@ -564,7 +588,24 @@ module RubyIndexer
       # new singleton methods or to extend a module through an include. There's no need to support instance methods, the
       # inclusion of another module or the prepending of another module, because those features are already a part of
       # Ruby and can be used directly without any metaprogramming
-      run_included_hooks(attached_class_name, nesting) if singleton_levels > 0
+      if singleton_levels > 0
+        run_included_hooks(attached_class_name, nesting)
+
+        # Re-fetch namespaces after running included hooks because hooks may have mutated the singleton class
+        # entry (e.g., adding mixin operations). The original `namespaces` array holds stale copies since
+        # `existing_or_new_singleton_class` moves the entry back to the buffer for mutation.
+        updated_entries = self[fully_qualified_name]
+        if updated_entries
+          namespaces = updated_entries.filter_map do |entry|
+            case entry
+            when Entry::Namespace
+              entry
+            when Entry::ConstantAlias
+              self[entry.target]&.grep(Entry::Namespace)
+            end
+          end.flatten
+        end
+      end
 
       linearize_mixins(ancestors, namespaces, nesting)
       linearize_superclass(
