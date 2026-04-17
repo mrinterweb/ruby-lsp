@@ -76,6 +76,17 @@ module RubyLsp
 
         # Instantiate all discovered add-on classes
         self.addons = addon_classes.map(&:new)
+
+        # Remove add-ons that the user has explicitly disabled via initializationOptions
+        disabled = global_state.disabled_addons
+        if disabled.any?
+          addons.reject! do |addon|
+            disabled.include?(addon.name)
+          rescue AbstractMethodInvokedError
+            false
+          end
+        end
+
         self.file_watcher_addons = addons.select { |addon| addon.respond_to?(:workspace_did_change_watched_files) }
 
         # Activate each one of the discovered add-ons. If any problems occur in the add-ons, we don't want to

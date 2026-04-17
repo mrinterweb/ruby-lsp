@@ -48,6 +48,9 @@ module RubyLsp
     #: String?
     attr_reader :telemetry_machine_id
 
+    #: Array[String]
+    attr_reader :disabled_addons
+
     #: -> void
     def initialize
       @workspace_uri = URI::Generic.from_path(path: Dir.pwd) #: URI::Generic
@@ -69,6 +72,7 @@ module RubyLsp
       end #: bool
       @client_capabilities = ClientCapabilities.new #: ClientCapabilities
       @enabled_feature_flags = {} #: Hash[Symbol, bool]
+      @disabled_addons = [] #: Array[String]
       @mutex = Mutex.new #: Mutex
       @telemetry_machine_id = nil #: String?
       @feature_configuration = {
@@ -209,6 +213,9 @@ module RubyLsp
 
       enabled_flags = options.dig(:initializationOptions, :enabledFeatureFlags)
       @enabled_feature_flags = enabled_flags if enabled_flags
+
+      disabled_addons = options.dig(:initializationOptions, :disabledAddons)
+      @disabled_addons = disabled_addons if disabled_addons.is_a?(Array)
 
       @telemetry_machine_id = options.dig(:initializationOptions, :telemetryMachineId)
 
