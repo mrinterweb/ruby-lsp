@@ -1245,8 +1245,10 @@ module RubyLsp
       # The begin progress invocation happens during `initialize`, so that the notification is sent before we are
       # stuck indexing files
       Thread.new do
+        freshly_indexed = false
+
         begin
-          @global_state.index.index_all do |percentage|
+          freshly_indexed = @global_state.index.index_all do |percentage|
             progress("indexing-progress", percentage)
             true
           rescue ClosedQueueError
@@ -1284,6 +1286,15 @@ module RubyLsp
         # Request a code lens refresh if we populated them before all test parent classes were indexed
         if @global_state.client_capabilities.supports_code_lens_refresh
           send_message(Request.new(id: @current_request_id, method: "workspace/codeLens/refresh", params: nil))
+        end
+
+        # If gems were freshly indexed into SQLite, request a restart so the new process starts with a clean heap
+        # and opens the cached DB without the memory overhead of parsing gems
+        if freshly_indexed && !@test_mode
+          send_message(Notification.new(
+            method: "rubyLsp/requestRestart",
+            params: { message: "Restarting to reclaim memory after initial gem indexing" },
+          ))
         end
       end
     end

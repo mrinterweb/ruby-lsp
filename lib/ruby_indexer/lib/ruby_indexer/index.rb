@@ -418,7 +418,8 @@ module RubyIndexer
     # Index all files for the given URIs, which defaults to what is configured. A block can be used to track and control
     # indexing progress. That block is invoked with the current progress percentage and should return `true` to continue
     # indexing or `false` to stop indexing.
-    #: (?uris: Array[URI::Generic]) ?{ (Integer progress) -> bool } -> void
+    # Returns true if gem/stdlib entries were freshly indexed (not cached), indicating a restart would help reclaim memory
+    #: (?uris: Array[URI::Generic]) ?{ (Integer progress) -> bool } -> bool
     def index_all(uris: @configuration.indexable_uris, &block)
       # When troubleshooting an indexing issue, e.g. through irb, it's not obvious that `index_all` will augment the
       # existing index values, meaning it may contain 'stale' entries. This check ensures that the user is aware of this
@@ -462,6 +463,7 @@ module RubyIndexer
       @sqlite_store&.set_metadata("lockfile_hash", compute_lockfile_hash)
 
       @initial_indexing_completed = true
+      !gems_reused
     end
 
     #: (URI::Generic uri, String source, ?collect_comments: bool) -> void
