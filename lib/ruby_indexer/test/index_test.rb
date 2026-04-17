@@ -232,8 +232,7 @@ module RubyIndexer
 
       entries = @index.resolve_method("baz", "Foo::Bar") #: as !nil
       assert_equal("baz", entries.first&.name)
-      owner = entries.first&.owner #: as !nil
-      assert_equal("Foo::Bar", owner.name)
+      assert_equal("Foo::Bar", entries.first&.owner_name)
     end
 
     def test_resolve_method_with_class_name_conflict
@@ -248,8 +247,7 @@ module RubyIndexer
 
       entries = @index.resolve_method("Array", "Foo") #: as !nil
       assert_equal("Array", entries.first&.name)
-      owner = entries.first&.owner #: as !nil
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entries.first&.owner_name)
     end
 
     def test_resolve_method_attribute
@@ -261,8 +259,7 @@ module RubyIndexer
 
       entries = @index.resolve_method("bar", "Foo") #: as !nil
       assert_equal("bar", entries.first&.name)
-      owner = entries.first&.owner #: as !nil
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entries.first&.owner_name)
     end
 
     def test_resolve_method_with_two_definitions
@@ -281,13 +278,11 @@ module RubyIndexer
       first_entry, second_entry = @index.resolve_method("bar", "Foo") #: as !nil
 
       assert_equal("bar", first_entry&.name)
-      owner = first_entry&.owner #: as !nil
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", first_entry&.owner_name)
       assert_includes(first_entry&.comments, "Hello from first `bar`")
 
       assert_equal("bar", second_entry&.name)
-      owner = second_entry&.owner #: as !nil
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", second_entry&.owner_name)
       assert_includes(second_entry&.comments, "Hello from second `bar`")
     end
 
@@ -303,7 +298,7 @@ module RubyIndexer
       RUBY
 
       entry = @index.resolve_method("baz", "Foo", inherited_only: true)&.first #: as !nil
-      assert_equal("Bar", entry.owner&.name)
+      assert_equal("Bar", entry.owner_name)
     end
 
     def test_resolve_method_inherited_only_for_prepended_module
@@ -766,11 +761,11 @@ module RubyIndexer
 
       entry = @index.resolve_method("baz", "Wow")&.first #: as !nil
       assert_equal("baz", entry.name)
-      assert_equal("Foo", entry.owner&.name)
+      assert_equal("Foo", entry.owner_name)
 
       entry = @index.resolve_method("qux", "Wow")&.first #: as !nil
       assert_equal("qux", entry.name)
-      assert_equal("Bar", entry.owner&.name)
+      assert_equal("Bar", entry.owner_name)
     end
 
     def test_resolving_an_inherited_method_lands_on_first_match
@@ -795,7 +790,7 @@ module RubyIndexer
 
       entry = entries.first #: as !nil
       assert_equal("qux", entry.name)
-      assert_equal("Foo", entry.owner&.name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_handle_change_clears_ancestor_cache_if_tree_changed
@@ -1260,7 +1255,7 @@ module RubyIndexer
 
       entry = @index.instance_variable_completion_candidates("@", "Bar").first #: as !nil
       assert_equal("@bar", entry.name)
-      assert_equal("Bar", entry.owner&.name)
+      assert_equal("Bar", entry.owner_name)
     end
 
     def test_resolving_a_qualified_reference
@@ -1517,7 +1512,7 @@ module RubyIndexer
       entry = methods.first #: as Entry::MethodAlias
       assert_kind_of(Entry::MethodAlias, entry)
       assert_equal("bar", entry.target.name)
-      assert_equal("Foo", entry.target.owner&.name)
+      assert_equal("Foo", entry.target.owner_name)
 
       # qux
       methods = @index.resolve_method("qux", "Bar") #: as !nil
@@ -1526,7 +1521,7 @@ module RubyIndexer
       entry = methods.first #: as Entry::MethodAlias
       assert_kind_of(Entry::MethodAlias, entry)
       assert_equal("hello", entry.target.name)
-      assert_equal("Bar", entry.target.owner&.name)
+      assert_equal("Bar", entry.target.owner_name)
 
       # double
       methods = @index.resolve_method("double", "Bar") #: as !nil
@@ -1538,12 +1533,12 @@ module RubyIndexer
       target = entry.target #: as Entry::MethodAlias
       assert_equal("double_alias", target.name)
       assert_kind_of(Entry::MethodAlias, target)
-      assert_equal("Foo", target.owner&.name)
+      assert_equal("Foo", target.owner_name)
 
       final_target = target.target
       assert_equal("bar", final_target.name)
       assert_kind_of(Entry::Method, final_target)
-      assert_equal("Foo", final_target.owner&.name)
+      assert_equal("Foo", final_target.owner_name)
     end
 
     def test_resolving_circular_method_aliases
@@ -1597,7 +1592,7 @@ module RubyIndexer
       target = entry.target
       assert_equal("name", target.name)
       assert_kind_of(Entry::Accessor, target)
-      assert_equal("Foo", target.owner&.name)
+      assert_equal("Foo", target.owner_name)
 
       other_decorated_name = @index["decorated_name"]&.find { |e| e.is_a?(Entry::UnresolvedMethodAlias) }
       assert_kind_of(Entry::UnresolvedMethodAlias, other_decorated_name)
@@ -1658,7 +1653,7 @@ module RubyIndexer
 
       entries = @index.method_completion_candidates("bar", "Baz")
       assert_equal(["bar"], entries.map(&:name))
-      assert_equal("Baz", entries.first&.owner&.name)
+      assert_equal("Baz", entries.first&.owner_name)
     end
 
     def test_completion_does_not_duplicate_methods_overridden_by_aliases
@@ -1674,7 +1669,7 @@ module RubyIndexer
 
       entries = @index.method_completion_candidates("bar", "Baz")
       assert_equal(["bar"], entries.map(&:name))
-      assert_equal("Baz", entries.first&.owner&.name)
+      assert_equal("Baz", entries.first&.owner_name)
     end
 
     def test_decorated_parameters

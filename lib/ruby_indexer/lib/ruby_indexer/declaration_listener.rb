@@ -143,7 +143,6 @@ module RubyIndexer
           )
         else
           entry = Entry::SingletonClass.new(
-            @index.configuration,
             real_nesting,
             @uri,
             Location.from_prism_location(node.location, @code_units_cache),
@@ -327,7 +326,6 @@ module RubyIndexer
         signatures = [Entry::Signature.new(list_params(node.parameters))]
 
         @index.add(Entry::Method.new(
-          @index.configuration,
           method_name,
           @uri,
           location,
@@ -335,14 +333,13 @@ module RubyIndexer
           comments,
           signatures,
           scope.visibility,
-          owner,
+          owner.name,
         ))
 
         if scope.module_func
           singleton = @index.existing_or_new_singleton_class(owner.name)
 
           @index.add(Entry::Method.new(
-            @index.configuration,
             method_name,
             @uri,
             location,
@@ -350,14 +347,13 @@ module RubyIndexer
             comments,
             signatures,
             :public,
-            singleton,
+            singleton.name,
           ))
         end
       when Prism::SelfNode
         singleton = @index.existing_or_new_singleton_class(owner.name)
 
         @index.add(Entry::Method.new(
-          @index.configuration,
           method_name,
           @uri,
           Location.from_prism_location(node.location, @code_units_cache),
@@ -365,7 +361,7 @@ module RubyIndexer
           comments,
           [Entry::Signature.new(list_params(node.parameters))],
           scope.visibility,
-          singleton,
+          singleton.name,
         ))
 
         @owner_stack << singleton
@@ -437,10 +433,9 @@ module RubyIndexer
       comments = collect_comments(node)
       @index.add(
         Entry::UnresolvedMethodAlias.new(
-          @index.configuration,
           method_name,
           node.old_name.slice,
-          @owner_stack.last,
+          @owner_stack.last&.name,
           @uri,
           Location.from_prism_location(node.new_name.location, @code_units_cache),
           comments,
@@ -478,7 +473,6 @@ module RubyIndexer
       location = Location.from_prism_location(node_location, @code_units_cache)
 
       @index.add(Entry::Method.new(
-        @index.configuration,
         name,
         @uri,
         location,
@@ -486,7 +480,7 @@ module RubyIndexer
         comments,
         signatures,
         visibility,
-        @owner_stack.last,
+        @owner_stack.last&.name,
       ))
     end
 
@@ -496,7 +490,6 @@ module RubyIndexer
       name_loc = Location.from_prism_location(name_location, @code_units_cache)
 
       entry = Entry::Module.new(
-        @index.configuration,
         Index.actual_nesting(@stack, name),
         @uri,
         location,
@@ -511,7 +504,6 @@ module RubyIndexer
     def add_class(name_or_nesting, full_location, name_location, parent_class_name: nil, comments: nil)
       nesting = name_or_nesting.is_a?(Array) ? name_or_nesting : Index.actual_nesting(@stack, name_or_nesting)
       entry = Entry::Class.new(
-        @index.configuration,
         nesting,
         @uri,
         Location.from_prism_location(full_location, @code_units_cache),
@@ -556,7 +548,6 @@ module RubyIndexer
       comments = collect_comments(node)
 
       @index.add(Entry::GlobalVariable.new(
-        @index.configuration,
         name,
         @uri,
         Location.from_prism_location(loc, @code_units_cache),
@@ -581,12 +572,11 @@ module RubyIndexer
       end
 
       @index.add(Entry::ClassVariable.new(
-        @index.configuration,
         name,
         @uri,
         Location.from_prism_location(loc, @code_units_cache),
         comments,
-        owner,
+        owner&.name,
       ))
     end
 
@@ -604,12 +594,11 @@ module RubyIndexer
       end
 
       @index.add(Entry::InstanceVariable.new(
-        @index.configuration,
         name,
         @uri,
         Location.from_prism_location(loc, @code_units_cache),
         collect_comments(node),
-        owner,
+        owner&.name,
       ))
     end
 
@@ -667,10 +656,9 @@ module RubyIndexer
       comments = collect_comments(node)
       @index.add(
         Entry::UnresolvedMethodAlias.new(
-          @index.configuration,
           new_name_value,
           old_name_value,
-          @owner_stack.last,
+          @owner_stack.last&.name,
           @uri,
           Location.from_prism_location(new_name.location, @code_units_cache),
           comments,
@@ -687,7 +675,6 @@ module RubyIndexer
         case value
         when Prism::ConstantReadNode, Prism::ConstantPathNode
           Entry::UnresolvedConstantAlias.new(
-            @index.configuration,
             value.slice,
             @stack.dup,
             name,
@@ -701,7 +688,6 @@ module RubyIndexer
           # If the right hand side is another constant assignment, we need to visit it because that constant has to be
           # indexed too
           Entry::UnresolvedConstantAlias.new(
-            @index.configuration,
             value.name.to_s,
             @stack.dup,
             name,
@@ -713,7 +699,6 @@ module RubyIndexer
         Prism::ConstantPathAndWriteNode
 
           Entry::UnresolvedConstantAlias.new(
-            @index.configuration,
             value.target.slice,
             @stack.dup,
             name,
@@ -723,7 +708,6 @@ module RubyIndexer
           )
         else
           Entry::Constant.new(
-            @index.configuration,
             name,
             @uri,
             Location.from_prism_location(node.location, @code_units_cache),
@@ -801,26 +785,24 @@ module RubyIndexer
 
         if reader
           @index.add(Entry::Accessor.new(
-            @index.configuration,
             name,
             @uri,
             Location.from_prism_location(loc, @code_units_cache),
             comments,
             scope.visibility,
-            @owner_stack.last,
+            @owner_stack.last&.name,
           ))
         end
 
         next unless writer
 
         @index.add(Entry::Accessor.new(
-          @index.configuration,
           "#{name}=",
           @uri,
           Location.from_prism_location(loc, @code_units_cache),
           comments,
           scope.visibility,
-          @owner_stack.last,
+          @owner_stack.last&.name,
         ))
       end
     end
@@ -889,7 +871,7 @@ module RubyIndexer
         next unless entries
 
         entries.each do |entry|
-          entry_owner_name = entry.owner&.name
+          entry_owner_name = entry.owner_name
           next unless entry_owner_name
 
           entry.visibility = :private
@@ -897,7 +879,6 @@ module RubyIndexer
           singleton = @index.existing_or_new_singleton_class(entry_owner_name)
           location = Location.from_prism_location(argument.location, @code_units_cache)
           @index.add(Entry::Method.new(
-            @index.configuration,
             method_name,
             @uri,
             location,
@@ -905,7 +886,7 @@ module RubyIndexer
             collect_comments(node)&.concat(entry.comments),
             entry.signatures,
             :public,
-            singleton,
+            singleton.name,
           ))
         end
       end

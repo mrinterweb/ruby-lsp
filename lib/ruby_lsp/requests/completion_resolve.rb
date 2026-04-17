@@ -50,7 +50,7 @@ module RubyLsp
           entries = entries.select do |entry|
             (entry.is_a?(RubyIndexer::Entry::Member) || entry.is_a?(RubyIndexer::Entry::InstanceVariable) ||
             entry.is_a?(RubyIndexer::Entry::MethodAlias) || entry.is_a?(RubyIndexer::Entry::ClassVariable)) &&
-              entry.owner&.name == owner_name
+              entry.owner_name == owner_name
           end
         end
 

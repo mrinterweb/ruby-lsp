@@ -8,6 +8,7 @@ module RubyIndexer
     #: (Index index) -> void
     def initialize(index)
       @index = index
+      @uri_cache = {} #: Hash[String, URI::Generic]
     end
 
     #: -> void
@@ -36,7 +37,7 @@ module RubyIndexer
         handle_class_or_module_declaration(declaration, pathname)
       when RBS::AST::Declarations::Constant
         namespace_nesting = declaration.name.namespace.path.map(&:to_s)
-        handle_constant(declaration, namespace_nesting, URI::Generic.from_path(path: pathname.to_s))
+        handle_constant(declaration, namespace_nesting, uri_for_path(pathname.to_s))
       when RBS::AST::Declarations::Global
         handle_global_variable(declaration, pathname)
       else # rubocop:disable Style/EmptyElse
@@ -47,14 +48,14 @@ module RubyIndexer
     #: ((RBS::AST::Declarations::Class | RBS::AST::Declarations::Module) declaration, Pathname pathname) -> void
     def handle_class_or_module_declaration(declaration, pathname)
       nesting = [declaration.name.name.to_s]
-      uri = URI::Generic.from_path(path: pathname.to_s)
+      uri = uri_for_path(pathname.to_s)
       location = to_ruby_indexer_location(declaration.location)
       comments = comments_to_string(declaration)
       entry = if declaration.is_a?(RBS::AST::Declarations::Class)
         parent_class = declaration.super_class&.name&.name&.to_s
-        Entry::Class.new(@index.configuration, nesting, uri, location, location, comments, parent_class)
+        Entry::Class.new(nesting, uri, location, location, comments, parent_class)
       else
-        Entry::Module.new(@index.configuration, nesting, uri, location, location, comments)
+        Entry::Module.new(nesting, uri, location, location, comments)
       end
 
       add_declaration_mixins_to_entry(declaration, entry)
@@ -72,6 +73,11 @@ module RubyIndexer
           handle_signature_alias(member, entry)
         end
       end
+    end
+
+    #: (String path) -> URI::Generic
+    def uri_for_path(path)
+      @uri_cache[path] ||= URI::Generic.from_path(path: path)
     end
 
     #: (RBS::Location rbs_location) -> RubyIndexer::Location
@@ -103,14 +109,13 @@ module RubyIndexer
     #: (RBS::AST::Members::MethodDefinition member, Entry::Namespace owner) -> void
     def handle_method(member, owner)
       name = member.name.name
-      uri = URI::Generic.from_path(path: member.location.buffer.name.to_s)
+      uri = uri_for_path(member.location.buffer.name.to_s)
       location = to_ruby_indexer_location(member.location)
       comments = comments_to_string(member)
 
       real_owner = member.singleton? ? @index.existing_or_new_singleton_class(owner.name) : owner
       signatures = signatures(member)
       @index.add(Entry::Method.new(
-        @index.configuration,
         name,
         uri,
         location,
@@ -118,7 +123,7 @@ module RubyIndexer
         comments,
         signatures,
         member.visibility || :public,
-        real_owner,
+        real_owner.name,
       ))
     end
 
@@ -244,7 +249,6 @@ module RubyIndexer
     def handle_constant(declaration, nesting, uri)
       fully_qualified_name = [*nesting, declaration.name.name.to_s].join("::")
       @index.add(Entry::Constant.new(
-        @index.configuration,
         fully_qualified_name,
         uri,
         to_ruby_indexer_location(declaration.location),
@@ -255,12 +259,11 @@ module RubyIndexer
     #: (RBS::AST::Declarations::Global declaration, Pathname pathname) -> void
     def handle_global_variable(declaration, pathname)
       name = declaration.name.to_s
-      uri = URI::Generic.from_path(path: pathname.to_s)
+      uri = uri_for_path(pathname.to_s)
       location = to_ruby_indexer_location(declaration.location)
       comments = comments_to_string(declaration)
 
       @index.add(Entry::GlobalVariable.new(
-        @index.configuration,
         name,
         uri,
         location,
@@ -270,14 +273,13 @@ module RubyIndexer
 
     #: (RBS::AST::Members::Alias member, Entry::Namespace owner_entry) -> void
     def handle_signature_alias(member, owner_entry)
-      uri = URI::Generic.from_path(path: member.location.buffer.name.to_s)
+      uri = uri_for_path(member.location.buffer.name.to_s)
       comments = comments_to_string(member)
 
       entry = Entry::UnresolvedMethodAlias.new(
-        @index.configuration,
         member.new_name.to_s,
         member.old_name.to_s,
-        owner_entry,
+        owner_entry.name,
         uri,
         to_ruby_indexer_location(member.location),
         comments,

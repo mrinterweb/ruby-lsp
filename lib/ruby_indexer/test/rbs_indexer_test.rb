@@ -57,7 +57,7 @@ module RubyIndexer
     def test_index_methods
       entries = @index["initialize"] #: as Array[Entry::Method]
       refute_nil(entries)
-      entry = entries.find { |entry| entry.owner&.name == "Array" } #: as Entry::Method
+      entry = entries.find { |entry| entry.owner_name == "Array" } #: as Entry::Method
       assert_match(%r{/gems/rbs-.*/core/array.rbs}, entry.file_path)
       assert_equal("array.rbs", entry.file_name)
       assert_equal(:public, entry.visibility)
@@ -87,9 +87,7 @@ module RubyIndexer
       entries = @index["basename"] #: as Array[Entry::Method]
       refute_nil(entries)
 
-      owner = entries.first&.owner #: as Entry::SingletonClass
-      assert_instance_of(Entry::SingletonClass, owner)
-      assert_equal("File::<Class:File>", owner.name)
+      assert_equal("File::<Class:File>", entries.first&.owner_name)
     end
 
     def test_location_and_name_location_are_the_same
@@ -122,7 +120,7 @@ module RubyIndexer
 
     def test_rbs_method_with_unnamed_required_positionals
       entries = @index["try_convert"] #: as Array[Entry::Method]
-      entry = entries.find { |entry| entry.owner&.name == "Array::<Class:Array>" } #: as Entry::Method
+      entry = entries.find { |entry| entry.owner_name == "Array::<Class:Array>" } #: as Entry::Method
 
       parameters = entry.signatures[0]&.parameters #: as Array[Entry::Parameter]
 
@@ -132,7 +130,7 @@ module RubyIndexer
 
     def test_rbs_method_with_optional_positionals
       entries = @index["polar"] #: as Array[Entry::Method]
-      entry = entries.find { |entry| entry.owner&.name == "Complex::<Class:Complex>" } #: as Entry::Method
+      entry = entries.find { |entry| entry.owner_name == "Complex::<Class:Complex>" } #: as Entry::Method
 
       # def self.polar: (Numeric, ?Numeric) -> Complex
 
@@ -190,7 +188,7 @@ module RubyIndexer
 
     def test_rbs_anonymous_block_parameter
       entries = @index["open"] #: as Array[Entry::Method]
-      entry = entries.find { |entry| entry.owner&.name == "File::<Class:File>" } #: as Entry::Method
+      entry = entries.find { |entry| entry.owner_name == "File::<Class:File>" } #: as Entry::Method
 
       assert_equal(2, entry.signatures.length)
 
@@ -213,7 +211,7 @@ module RubyIndexer
 
     def test_rbs_method_with_rest_positionals
       entries = @index["count"] #: as Array[Entry::Method]
-      entry = entries.find { |entry| entry.owner&.name == "String" } #: as Entry::Method
+      entry = entries.find { |entry| entry.owner_name == "String" } #: as Entry::Method
 
       parameters = entry.signatures.first&.parameters #: as !nil
       assert_equal(1, entry.signatures.length)
@@ -227,7 +225,7 @@ module RubyIndexer
 
     def test_rbs_method_with_trailing_positionals
       entries = @index["select"] #: as Array[Entry::Method]
-      entry = entries.find { |entry| entry.owner&.name == "IO::<Class:IO>" } #: as !nil
+      entry = entries.find { |entry| entry.owner_name == "IO::<Class:IO>" } #: as !nil
 
       signatures = entry.signatures
       assert_equal(2, signatures.length)
@@ -251,7 +249,7 @@ module RubyIndexer
 
     def test_rbs_method_with_optional_keywords
       entries = @index["step"] #: as Array[Entry::Method]
-      entry = entries.find { |entry| entry.owner&.name == "Numeric" } #: as !nil
+      entry = entries.find { |entry| entry.owner_name == "Numeric" } #: as !nil
 
       signatures = entry.signatures
       assert_equal(4, signatures.length)
@@ -302,7 +300,7 @@ module RubyIndexer
 
     def test_rbs_method_with_rest_keywords
       entries = @index["method_missing"] #: as Array[Entry::Method]
-      entry = entries.find { |entry| entry.owner&.name == "BasicObject" } #: as !nil
+      entry = entries.find { |entry| entry.owner_name == "BasicObject" } #: as !nil
       signatures = entry.signatures
       assert_equal(1, signatures.length)
 
@@ -343,14 +341,14 @@ module RubyIndexer
       # It does not mean the same thing as a Ruby alias.
       any_entries = @index["any?"] #: as Array[Entry::UnresolvedMethodAlias]
 
-      assert_equal(["Array", "Enumerable", "Hash"], any_entries.map { _1.owner&.name })
+      assert_equal(["Array", "Enumerable", "Hash"], any_entries.map { _1.owner_name })
 
-      entry = any_entries.find { |entry| entry.owner&.name == "Array" } #: as !nil
+      entry = any_entries.find { |entry| entry.owner_name == "Array" } #: as !nil
 
       assert_kind_of(RubyIndexer::Entry::UnresolvedMethodAlias, entry)
       assert_equal("any?", entry.name)
       assert_equal("all?", entry.old_name)
-      assert_equal("Array", entry.owner&.name)
+      assert_equal("Array", entry.owner_name)
       assert(entry.file_path&.end_with?("core/array.rbs"))
       refute_empty(entry.comments)
     end

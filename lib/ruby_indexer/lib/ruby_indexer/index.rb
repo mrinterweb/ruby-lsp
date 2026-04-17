@@ -78,6 +78,7 @@ module RubyIndexer
       @included_hooks = {} #: Hash[String, Array[^(Index index, Entry::Namespace base) -> void]]
 
       @configuration = RubyIndexer::Configuration.new #: Configuration
+      Entry.configuration = @configuration
 
       @initial_indexing_completed = false #: bool
     end
@@ -135,7 +136,8 @@ module RubyIndexer
 
     #: (String fully_qualified_name) -> Array[Entry]?
     def [](fully_qualified_name)
-      @entries[fully_qualified_name.delete_prefix("::")]
+      name = fully_qualified_name.start_with?("::") ? fully_qualified_name.delete_prefix("::") : fully_qualified_name
+      @entries[name]
     end
 
     #: (String query) -> Array[URI::Generic]
@@ -235,7 +237,7 @@ module RubyIndexer
         end
 
         entry_name = entry.name
-        ancestor_index = ancestors.index(entry.owner&.name)
+        ancestor_index = ancestors.index(entry.owner_name)
         existing_entry, existing_entry_index = hash[entry_name]
 
         # Conditions for matching a method completion candidate:
@@ -471,10 +473,10 @@ module RubyIndexer
         found = method_entries.filter_map do |entry|
           case entry
           when Entry::Member, Entry::MethodAlias
-            entry if entry.owner&.name == ancestor
+            entry if entry.owner_name == ancestor
           when Entry::UnresolvedMethodAlias
             # Resolve aliases lazily as we find them
-            if entry.owner&.name == ancestor
+            if entry.owner_name == ancestor
               resolved_alias = resolve_method_alias(entry, receiver_name, seen_names)
               resolved_alias if resolved_alias.is_a?(Entry::MethodAlias)
             end
@@ -584,7 +586,7 @@ module RubyIndexer
       ancestors = linearized_ancestors_of(owner_name)
       return if ancestors.empty?
 
-      entries.select { |e| ancestors.include?(e.owner&.name) }
+      entries.select { |e| ancestors.include?(e.owner_name) }
     end
 
     #: (String variable_name, String owner_name) -> Array[Entry::ClassVariable]?
@@ -595,7 +597,7 @@ module RubyIndexer
       ancestors = linearized_attached_ancestors(owner_name)
       return if ancestors.empty?
 
-      entries.select { |e| ancestors.include?(e.owner&.name) }
+      entries.select { |e| ancestors.include?(e.owner_name) }
     end
 
     # Returns a list of possible candidates for completion of instance variables for a given owner name. The name must
@@ -609,7 +611,7 @@ module RubyIndexer
       ancestors = linearized_ancestors_of(owner_name)
 
       instance_variables, class_variables = entries.partition { |e| e.is_a?(Entry::InstanceVariable) }
-      variables = instance_variables.select { |e| ancestors.any?(e.owner&.name) }
+      variables = instance_variables.select { |e| ancestors.any?(e.owner_name) }
 
       # Class variables are only owned by the attached class in our representation. If the owner is in a singleton
       # context, we have to search for ancestors of the attached class
@@ -620,9 +622,9 @@ module RubyIndexer
           attached_name = name_parts[0..-2] #: as !nil
             .join("::")
           attached_ancestors = linearized_ancestors_of(attached_name)
-          variables.concat(class_variables.select { |e| attached_ancestors.any?(e.owner&.name) })
+          variables.concat(class_variables.select { |e| attached_ancestors.any?(e.owner_name) })
         else
-          variables.concat(class_variables.select { |e| ancestors.any?(e.owner&.name) })
+          variables.concat(class_variables.select { |e| ancestors.any?(e.owner_name) })
         end
       end
 
@@ -637,7 +639,7 @@ module RubyIndexer
       return entries if entries.empty?
 
       ancestors = linearized_attached_ancestors(owner_name)
-      variables = entries.select { |e| ancestors.any?(e.owner&.name) }
+      variables = entries.select { |e| ancestors.any?(e.owner_name) }
       variables.uniq!(&:name)
       variables
     end
@@ -714,7 +716,6 @@ module RubyIndexer
         attached_ancestor = self[name]&.first #: as !nil
 
         singleton = Entry::SingletonClass.new(
-          @configuration,
           [full_singleton_name],
           attached_ancestor.uri,
           attached_ancestor.location,

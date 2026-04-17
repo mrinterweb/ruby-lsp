@@ -15,9 +15,7 @@ module RubyIndexer
       assert_entry("@@bar", Entry::ClassVariable, "/fake/path/foo.rb:1-2:1-7")
 
       entry = @index["@@bar"]&.first #: as Entry::ClassVariable
-      owner = entry.owner #: as !nil
-      assert_instance_of(Entry::Class, owner)
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_class_variable_operator_write
@@ -51,14 +49,10 @@ module RubyIndexer
       assert_entry("@@bar", Entry::ClassVariable, "/fake/path/foo.rb:1-9:1-14")
 
       entry = @index["@@foo"]&.first #: as Entry::ClassVariable
-      owner = entry.owner #: as !nil
-      assert_instance_of(Entry::Class, owner)
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entry.owner_name)
 
       entry = @index["@@bar"]&.first #: as Entry::ClassVariable
-      owner = entry.owner #: as !nil
-      assert_instance_of(Entry::Class, owner)
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_class_variable_write
@@ -87,7 +81,7 @@ module RubyIndexer
       RUBY
 
       entry = @index["@@foo"]&.first #: as Entry::ClassVariable
-      assert_nil(entry.owner)
+      assert_nil(entry.owner_name)
     end
 
     def test_class_variable_inside_self_method
@@ -100,9 +94,7 @@ module RubyIndexer
       RUBY
 
       entry = @index["@@bar"]&.first #: as Entry::ClassVariable
-      owner = entry.owner #: as !nil
-      assert_instance_of(Entry::Class, owner)
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_class_variable_inside_singleton_class
@@ -115,9 +107,7 @@ module RubyIndexer
       RUBY
 
       entry = @index["@@bar"]&.first #: as Entry::ClassVariable
-      owner = entry.owner #: as !nil
-      assert_instance_of(Entry::Class, owner)
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_class_variable_in_singleton_class_method
@@ -132,9 +122,7 @@ module RubyIndexer
       RUBY
 
       entry = @index["@@bar"]&.first #: as Entry::ClassVariable
-      owner = entry.owner #: as !nil
-      assert_instance_of(Entry::Class, owner)
-      assert_equal("Foo", owner.name)
+      assert_equal("Foo", entry.owner_name)
     end
   end
 end

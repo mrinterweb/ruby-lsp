@@ -48,9 +48,7 @@ module RubyIndexer
       assert_entry("bar", Entry::Method, "/fake/path/foo.rb:1-2:2-5")
 
       entry = @index["bar"]&.first #: as Entry::Method
-      owner = entry.owner
-      assert_equal("Foo::<Class:Foo>", owner&.name)
-      assert_instance_of(Entry::SingletonClass, owner)
+      assert_equal("Foo::<Class:Foo>", entry.owner_name)
     end
 
     def test_singleton_method_using_other_receiver_is_not_indexed
@@ -81,9 +79,9 @@ module RubyIndexer
 
       assert_equal(2, @index["bar"]&.length)
       first_entry = @index["bar"]&.first #: as Entry::Method
-      assert_equal("Foo::self::Bar", first_entry.owner&.name)
+      assert_equal("Foo::self::Bar", first_entry.owner_name)
       second_entry = @index["bar"]&.last #: as Entry::Method
-      assert_equal("Bar", second_entry.owner&.name)
+      assert_equal("Bar", second_entry.owner_name)
     end
 
     def test_visibility_tracking
@@ -141,12 +139,10 @@ module RubyIndexer
         assert_equal(entries.size, 2)
         first_entry, second_entry = *entries
         # The first entry points to the location of the module_function call
-        assert_equal("Test", first_entry&.owner&.name)
-        assert_instance_of(Entry::Module, first_entry&.owner)
+        assert_equal("Test", first_entry&.owner_name)
         assert_predicate(first_entry, :private?)
         # The second entry points to the public singleton method
-        assert_equal("Test::<Class:Test>", second_entry&.owner&.name)
-        assert_instance_of(Entry::SingletonClass, second_entry&.owner)
+        assert_equal("Test::<Class:Test>", second_entry&.owner_name)
         assert_equal(:public, second_entry&.visibility)
       end
     end
@@ -517,9 +513,7 @@ module RubyIndexer
       RUBY
 
       entry = @index["bar"]&.first #: as Entry::Method
-      owner_name = entry.owner&.name
-
-      assert_equal("Foo", owner_name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_keeps_track_of_attributes
@@ -566,13 +560,13 @@ module RubyIndexer
       RUBY
 
       entry = @index["first_method"]&.first #: as Entry::Method
-      assert_equal("Foo", entry.owner&.name)
+      assert_equal("Foo", entry.owner_name)
 
       entry = @index["second_method"]&.first #: as Entry::Method
-      assert_equal("Foo::Bar", entry.owner&.name)
+      assert_equal("Foo::Bar", entry.owner_name)
 
       entry = @index["third_method"]&.first #: as Entry::Method
-      assert_equal("Foo", entry.owner&.name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_keeps_track_of_aliases
@@ -612,12 +606,9 @@ module RubyIndexer
       bar = @index["bar"]&.first #: as Entry::Method
       baz = @index["baz"]&.first #: as Entry::Method
 
-      assert_instance_of(Entry::SingletonClass, bar.owner)
-      assert_instance_of(Entry::SingletonClass, baz.owner)
-
-      # Regardless of whether the method was added through `self.something` or `class << self`, the owner object must be
+      # Regardless of whether the method was added through `self.something` or `class << self`, the owner must be
       # the exact same
-      assert_same(bar.owner, baz.owner)
+      assert_equal(bar.owner_name, baz.owner_name)
     end
 
     def test_name_location_points_to_method_identifier_location
@@ -866,25 +857,25 @@ module RubyIndexer
 
       entry = @index["bar"]&.first #: as Entry::Method
       assert_predicate(entry, :public?)
-      assert_equal("Foo", entry.owner&.name)
+      assert_equal("Foo", entry.owner_name)
 
       instance_baz, singleton_baz = @index["baz"] #: as Array[Entry::Method]
       assert_predicate(instance_baz, :private?)
-      assert_equal("Foo", instance_baz&.owner&.name)
+      assert_equal("Foo", instance_baz&.owner_name)
 
       assert_predicate(singleton_baz, :public?)
-      assert_equal("Foo::<Class:Foo>", singleton_baz&.owner&.name)
+      assert_equal("Foo::<Class:Foo>", singleton_baz&.owner_name)
 
       # After invoking `public`, the state of `module_function` is reset
       instance_qux, singleton_qux = @index["qux"] #: as Array[Entry::Method]
       assert_nil(singleton_qux)
       assert_predicate(instance_qux, :public?)
-      assert_equal("Foo", instance_baz&.owner&.name)
+      assert_equal("Foo", instance_baz&.owner_name)
 
       # Attributes are not turned into class methods, they do become private
       instance_attribute, singleton_attribute = @index["attribute"] #: as Array[Entry::Method]
       assert_nil(singleton_attribute)
-      assert_equal("Foo", instance_attribute&.owner&.name)
+      assert_equal("Foo", instance_attribute&.owner_name)
       assert_predicate(instance_attribute, :private?)
     end
 
@@ -902,11 +893,11 @@ module RubyIndexer
 
       entry = @index["bar"]&.first #: as Entry::Method
       assert_predicate(entry, :public?)
-      assert_equal("Foo", entry.owner&.name)
+      assert_equal("Foo", entry.owner_name)
 
       entry = @index["baz"]&.first #: as Entry::Method
       assert_predicate(entry, :public?)
-      assert_equal("Foo", entry.owner&.name)
+      assert_equal("Foo", entry.owner_name)
     end
 
     def test_making_several_class_methods_private

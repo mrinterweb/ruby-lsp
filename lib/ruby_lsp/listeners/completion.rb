@@ -378,7 +378,7 @@ module RubyLsp
             ),
             kind: Constant::CompletionItemKind::FIELD,
             data: {
-              owner_name: entry.owner&.name,
+              owner_name: entry.owner_name,
             },
           )
         end
@@ -412,7 +412,7 @@ module RubyLsp
             ),
             kind: Constant::CompletionItemKind::FIELD,
             data: {
-              owner_name: entry.owner&.name,
+              owner_name: entry.owner_name,
             },
           )
         end
@@ -518,7 +518,7 @@ module RubyLsp
           next if entry.visibility != :public && external_references
 
           entry_name = entry.name
-          owner_name = entry.owner&.name
+          owner_name = entry.owner_name
           new_text = entry_name
 
           if entry_name.end_with?("=")

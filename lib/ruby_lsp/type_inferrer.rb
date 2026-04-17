@@ -101,7 +101,7 @@ module RubyLsp
 
           # If the method `new` was overridden, then we cannot assume that it will return a new instance of the class
           new_method = @index.resolve_method("new", type.name)&.first
-          return if new_method && new_method.owner&.name != "Class"
+          return if new_method && new_method.owner_name != "Class"
 
           type.attached
         elsif raw_receiver

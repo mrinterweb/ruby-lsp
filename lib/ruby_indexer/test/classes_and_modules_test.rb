@@ -689,7 +689,7 @@ module RubyIndexer
       assert_entry("Foo::Bar::<Class:Bar>", Entry::SingletonClass, "/fake/path/foo.rb:1-2:3-5")
 
       method = @index["baz"]&.first #: as Entry::Method
-      assert_equal("Foo::Bar::<Class:Bar>", method.owner&.name)
+      assert_equal("Foo::Bar::<Class:Bar>", method.owner_name)
     end
 
     def test_lazy_comments_with_spaces_are_properly_attributed

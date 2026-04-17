@@ -3,8 +3,10 @@
 
 module RubyIndexer
   class Entry
-    #: Configuration
-    attr_reader :configuration
+    class << self
+      #: Configuration?
+      attr_accessor :configuration
+    end
 
     #: String
     attr_reader :name
@@ -20,10 +22,9 @@ module RubyIndexer
     #: Symbol
     attr_accessor :visibility
 
-    #: (Configuration configuration, String name, URI::Generic uri, Location location, String? comments) -> void
-    def initialize(configuration, name, uri, location, comments)
-      @configuration = configuration
-      @name = name
+    #: (String name, URI::Generic uri, Location location, String? comments) -> void
+    def initialize(name, uri, location, comments)
+      @name = -name
       @uri = uri
       @comments = comments
       @visibility = :public #: Symbol
@@ -86,7 +87,7 @@ module RubyIndexer
           correct_group.filter_map do |comment|
             content = comment.slice.chomp
 
-            if content.valid_encoding? && !content.match?(@configuration.magic_comment_regex)
+            if content.valid_encoding? && !content.match?(Entry.configuration.magic_comment_regex)
               content.delete_prefix!("#")
               content.delete_prefix!(" ")
               content
@@ -109,7 +110,7 @@ module RubyIndexer
 
       #: (String module_name) -> void
       def initialize(module_name)
-        @module_name = module_name
+        @module_name = -module_name
       end
     end
 
@@ -125,13 +126,13 @@ module RubyIndexer
       #: Location
       attr_reader :name_location
 
-      #: (Configuration configuration, Array[String] nesting, URI::Generic uri, Location location, Location name_location, String? comments) -> void
-      def initialize(configuration, nesting, uri, location, name_location, comments) # rubocop:disable Metrics/ParameterLists
-        @name = nesting.join("::") #: String
+      #: (Array[String] nesting, URI::Generic uri, Location location, Location name_location, String? comments) -> void
+      def initialize(nesting, uri, location, name_location, comments)
+        @name = -nesting.join("::") #: String
         # The original nesting where this namespace was discovered
         @nesting = nesting
 
-        super(configuration, @name, uri, location, comments)
+        super(@name, uri, location, comments)
 
         @name_location = name_location
       end
@@ -164,9 +165,9 @@ module RubyIndexer
       #: String?
       attr_reader :parent_class
 
-      #: (Configuration configuration, Array[String] nesting, URI::Generic uri, Location location, Location name_location, String? comments, String? parent_class) -> void
-      def initialize(configuration, nesting, uri, location, name_location, comments, parent_class) # rubocop:disable Metrics/ParameterLists
-        super(configuration, nesting, uri, location, name_location, comments)
+      #: (Array[String] nesting, URI::Generic uri, Location location, Location name_location, String? comments, String? parent_class) -> void
+      def initialize(nesting, uri, location, name_location, comments, parent_class) # rubocop:disable Metrics/ParameterLists
+        super(nesting, uri, location, name_location, comments)
         @parent_class = parent_class
       end
 
@@ -286,14 +287,14 @@ module RubyIndexer
 
     # @abstract
     class Member < Entry
-      #: Entry::Namespace?
-      attr_reader :owner
+      #: String?
+      attr_reader :owner_name
 
-      #: (Configuration configuration, String name, URI::Generic uri, Location location, String? comments, Symbol visibility, Entry::Namespace? owner) -> void
-      def initialize(configuration, name, uri, location, comments, visibility, owner) # rubocop:disable Metrics/ParameterLists
-        super(configuration, name, uri, location, comments)
+      #: (String name, URI::Generic uri, Location location, String? comments, Symbol visibility, String? owner_name) -> void
+      def initialize(name, uri, location, comments, visibility, owner_name) # rubocop:disable Metrics/ParameterLists
+        super(name, uri, location, comments)
         @visibility = visibility
-        @owner = owner
+        @owner_name = owner_name
       end
 
       # @abstract
@@ -345,9 +346,9 @@ module RubyIndexer
       #: Location
       attr_reader :name_location
 
-      #: (Configuration configuration, String name, URI::Generic uri, Location location, Location name_location, String? comments, Array[Signature] signatures, Symbol visibility, Entry::Namespace? owner) -> void
-      def initialize(configuration, name, uri, location, name_location, comments, signatures, visibility, owner) # rubocop:disable Metrics/ParameterLists
-        super(configuration, name, uri, location, comments, visibility, owner)
+      #: (String name, URI::Generic uri, Location location, Location name_location, String? comments, Array[Signature] signatures, Symbol visibility, String? owner_name) -> void
+      def initialize(name, uri, location, name_location, comments, signatures, visibility, owner_name) # rubocop:disable Metrics/ParameterLists
+        super(name, uri, location, comments, visibility, owner_name)
         @signatures = signatures
         @name_location = name_location
       end
@@ -370,9 +371,9 @@ module RubyIndexer
       #: Array[String]
       attr_reader :nesting
 
-      #: (Configuration configuration, String target, Array[String] nesting, String name, URI::Generic uri, Location location, String? comments) -> void
-      def initialize(configuration, target, nesting, name, uri, location, comments) # rubocop:disable Metrics/ParameterLists
-        super(configuration, name, uri, location, comments)
+      #: (String target, Array[String] nesting, String name, URI::Generic uri, Location location, String? comments) -> void
+      def initialize(target, nesting, name, uri, location, comments) # rubocop:disable Metrics/ParameterLists
+        super(name, uri, location, comments)
 
         @target = target
         @nesting = nesting
@@ -387,7 +388,6 @@ module RubyIndexer
       #: (String target, UnresolvedConstantAlias unresolved_alias) -> void
       def initialize(target, unresolved_alias)
         super(
-          unresolved_alias.configuration,
           unresolved_alias.name,
           unresolved_alias.uri,
           unresolved_alias.location,
@@ -404,25 +404,25 @@ module RubyIndexer
 
     # Represents a class variable e.g.: @@a = 1
     class ClassVariable < Entry
-      #: Entry::Namespace?
-      attr_reader :owner
+      #: String?
+      attr_reader :owner_name
 
-      #: (Configuration configuration, String name, URI::Generic uri, Location location, String? comments, Entry::Namespace? owner) -> void
-      def initialize(configuration, name, uri, location, comments, owner) # rubocop:disable Metrics/ParameterLists
-        super(configuration, name, uri, location, comments)
-        @owner = owner
+      #: (String name, URI::Generic uri, Location location, String? comments, String? owner_name) -> void
+      def initialize(name, uri, location, comments, owner_name)
+        super(name, uri, location, comments)
+        @owner_name = owner_name
       end
     end
 
     # Represents an instance variable e.g.: @a = 1
     class InstanceVariable < Entry
-      #: Entry::Namespace?
-      attr_reader :owner
+      #: String?
+      attr_reader :owner_name
 
-      #: (Configuration configuration, String name, URI::Generic uri, Location location, String? comments, Entry::Namespace? owner) -> void
-      def initialize(configuration, name, uri, location, comments, owner) # rubocop:disable Metrics/ParameterLists
-        super(configuration, name, uri, location, comments)
-        @owner = owner
+      #: (String name, URI::Generic uri, Location location, String? comments, String? owner_name) -> void
+      def initialize(name, uri, location, comments, owner_name)
+        super(name, uri, location, comments)
+        @owner_name = owner_name
       end
     end
 
@@ -433,16 +433,16 @@ module RubyIndexer
       #: String
       attr_reader :new_name, :old_name
 
-      #: Entry::Namespace?
-      attr_reader :owner
+      #: String?
+      attr_reader :owner_name
 
-      #: (Configuration configuration, String new_name, String old_name, Entry::Namespace? owner, URI::Generic uri, Location location, String? comments) -> void
-      def initialize(configuration, new_name, old_name, owner, uri, location, comments) # rubocop:disable Metrics/ParameterLists
-        super(configuration, new_name, uri, location, comments)
+      #: (String new_name, String old_name, String? owner_name, URI::Generic uri, Location location, String? comments) -> void
+      def initialize(new_name, old_name, owner_name, uri, location, comments) # rubocop:disable Metrics/ParameterLists
+        super(new_name, uri, location, comments)
 
         @new_name = new_name
         @old_name = old_name
-        @owner = owner
+        @owner_name = owner_name
       end
     end
 
@@ -451,8 +451,8 @@ module RubyIndexer
       #: (Member | MethodAlias)
       attr_reader :target
 
-      #: Entry::Namespace?
-      attr_reader :owner
+      #: String?
+      attr_reader :owner_name
 
       #: ((Member | MethodAlias) target, UnresolvedMethodAlias unresolved_alias) -> void
       def initialize(target, unresolved_alias)
@@ -461,7 +461,6 @@ module RubyIndexer
         full_comments << target.comments
 
         super(
-          unresolved_alias.configuration,
           unresolved_alias.new_name,
           unresolved_alias.uri,
           unresolved_alias.location,
@@ -469,7 +468,7 @@ module RubyIndexer
         )
 
         @target = target
-        @owner = unresolved_alias.owner #: Entry::Namespace?
+        @owner_name = unresolved_alias.owner_name
       end
 
       #: -> String
