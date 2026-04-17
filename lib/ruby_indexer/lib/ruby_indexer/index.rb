@@ -85,7 +85,7 @@ module RubyIndexer
 
       @sqlite_store = nil #: SQLiteStore?
       @sqlite_buffer = [] #: Array[Entry]
-      @sqlite_buffer_size = 100 #: Integer
+      @sqlite_buffer_size = 5000 #: Integer
 
       @initial_indexing_completed = false #: bool
     end
@@ -1259,7 +1259,6 @@ module RubyIndexer
 
       @sqlite_store.bulk_insert(entries_hash, uris_hash, @require_paths_tree)
       @sqlite_buffer.clear
-      GC.start
     end
   end
 end

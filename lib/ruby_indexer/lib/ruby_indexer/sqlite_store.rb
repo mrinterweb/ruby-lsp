@@ -368,12 +368,9 @@ module RubyIndexer
       # Old name (for UnresolvedMethodAlias)
       old_name = entry.old_name if entry.is_a?(Entry::UnresolvedMethodAlias)
 
-      # Comments - eagerly resolve and store
-      comments = begin
-        entry.comments
-      rescue StandardError
-        nil
-      end
+      # Skip eager comment loading — comments are expensive to parse (re-reads each file).
+      # They'll be lazily loaded from disk when materialized entries are accessed.
+      comments = entry.instance_variable_get(:@comments)
 
       stmt.execute(
         entry.name,
