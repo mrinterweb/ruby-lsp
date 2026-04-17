@@ -1,6 +1,9 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "digest/sha1"
+require "fileutils"
+
 module RubyIndexer
   class Index
     class UnresolvableAliasError < StandardError; end
@@ -80,6 +83,10 @@ module RubyIndexer
       @configuration = RubyIndexer::Configuration.new #: Configuration
       Entry.configuration = @configuration
 
+      @sqlite_store = nil #: SQLiteStore?
+      @sqlite_buffer = [] #: Array[Entry]
+      @sqlite_buffer_size = 100 #: Integer
+
       @initial_indexing_completed = false #: bool
     end
 
@@ -113,6 +120,7 @@ module RubyIndexer
       end
 
       @uris_to_entries.delete(key)
+      @sqlite_store&.delete(key)
       return if skip_require_paths_tree
 
       require_path = uri.require_path
@@ -122,6 +130,13 @@ module RubyIndexer
     #: (Entry entry, ?skip_prefix_tree: bool) -> void
     def add(entry, skip_prefix_tree: false)
       name = entry.name
+
+      # During initial indexing, route gem/stdlib entries to SQLite buffer
+      if @sqlite_store && !@initial_indexing_completed && !workspace_uri?(entry.uri)
+        @sqlite_buffer << entry
+        flush_sqlite_buffer! if @sqlite_buffer.length >= @sqlite_buffer_size
+        return
+      end
 
       (@entries[name] ||= []) << entry
       (@uris_to_entries[entry.uri.to_s] ||= []) << entry
@@ -137,12 +152,28 @@ module RubyIndexer
     #: (String fully_qualified_name) -> Array[Entry]?
     def [](fully_qualified_name)
       name = fully_qualified_name.start_with?("::") ? fully_qualified_name.delete_prefix("::") : fully_qualified_name
-      @entries[name]
+      in_memory = @entries[name]
+      sqlite = @sqlite_store&.[](name)
+
+      # Check the unflushed buffer during indexing
+      buffered = if @sqlite_buffer.any?
+        matches = @sqlite_buffer.select { |e| e.name == name }
+        matches.empty? ? nil : matches
+      end
+
+      parts = [in_memory, sqlite, buffered].compact
+      return if parts.empty?
+
+      parts.length == 1 ? parts.first : parts.reduce(:+)
     end
 
     #: (String query) -> Array[URI::Generic]
     def search_require_paths(query)
-      @require_paths_tree.search(query)
+      results = @require_paths_tree.search(query)
+      if @sqlite_store
+        results.concat(@sqlite_store.search_require_paths(query))
+      end
+      results
     end
 
     # Searches for a constant based on an unqualified name and returns the first possible match regardless of whether
@@ -159,6 +190,10 @@ module RubyIndexer
         _name, entries = @entries.find do |const_name, _entries|
           const_name.end_with?(name)
         end
+      end
+
+      unless entries
+        entries = @sqlite_store&.first_unqualified_const(name)
       end
 
       entries #: as Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]?
@@ -181,6 +216,9 @@ module RubyIndexer
     def prefix_search(query, nesting = nil)
       unless nesting
         results = @entries_tree.search(query)
+        if @sqlite_store
+          results.concat(@sqlite_store.prefix_search(query))
+        end
         results.uniq!
         return results
       end
@@ -189,7 +227,11 @@ module RubyIndexer
         prefix = nesting[0...i] #: as !nil
           .join("::")
         namespaced_query = prefix.empty? ? query : "#{prefix}::#{query}"
-        @entries_tree.search(namespaced_query)
+        tree_results = @entries_tree.search(namespaced_query)
+        if @sqlite_store
+          tree_results.concat(@sqlite_store.prefix_search(namespaced_query))
+        end
+        tree_results
       end
 
       results.uniq!
@@ -207,6 +249,15 @@ module RubyIndexer
           entries
         end
 
+        if @sqlite_store
+          @sqlite_store.all_entries_with_names.each do |_name, sqlite_entries|
+            next if sqlite_entries.first.is_a?(Entry::SingletonClass)
+
+            sqlite_entries = sqlite_entries.select(&condition) if condition
+            entries << sqlite_entries unless sqlite_entries.empty?
+          end
+        end
+
         return entries.flatten
       end
 
@@ -220,6 +271,18 @@ module RubyIndexer
 
         similarity = DidYouMean::JaroWinkler.distance(name.gsub("::", "").downcase, normalized_query)
         [entries, -similarity] if similarity > ENTRY_SIMILARITY_THRESHOLD
+      end
+
+      if @sqlite_store
+        @sqlite_store.all_entries_with_names.each do |name, sqlite_entries|
+          next if sqlite_entries.first.is_a?(Entry::SingletonClass)
+
+          sqlite_entries = sqlite_entries.select(&condition) if condition
+          next if sqlite_entries.empty?
+
+          similarity = DidYouMean::JaroWinkler.distance(name.gsub("::", "").downcase, normalized_query)
+          results << [sqlite_entries, -similarity] if similarity > ENTRY_SIMILARITY_THRESHOLD
+        end
       end
       results.sort_by!(&:last)
       results.flat_map(&:first)
@@ -272,20 +335,20 @@ module RubyIndexer
     def constant_completion_candidates(name, nesting)
       # If we have a top level reference, then we don't need to include completions inside the current nesting
       if name.start_with?("::")
-        return @entries_tree.search(name.delete_prefix("::")) #: as Array[Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]]
+        return combined_prefix_search(name.delete_prefix("::")) #: as Array[Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]]
       end
 
       # Otherwise, we have to include every possible constant the user might be referring to. This is essentially the
       # same algorithm as resolve, but instead of returning early we concatenate all unique results
 
       # Direct constants inside this namespace
-      entries = @entries_tree.search(nesting.any? ? "#{nesting.join("::")}::#{name}" : name)
+      entries = combined_prefix_search(nesting.any? ? "#{nesting.join("::")}::#{name}" : name)
 
       # Constants defined in enclosing scopes
       nesting.length.downto(1) do |i|
         namespace = nesting[0...i] #: as !nil
           .join("::")
-        entries.concat(@entries_tree.search("#{namespace}::#{name}"))
+        entries.concat(combined_prefix_search("#{namespace}::#{name}"))
       end
 
       # Inherited constants
@@ -296,7 +359,7 @@ module RubyIndexer
       end
 
       # Top level constants
-      entries.concat(@entries_tree.search(name))
+      entries.concat(combined_prefix_search(name))
 
       # Filter only constants since methods may have names that look like constants
       entries.select! do |definitions|
@@ -365,6 +428,9 @@ module RubyIndexer
           "The index is not empty. To prevent invalid entries, `index_all` can only be called once."
       end
 
+      # Initialize SQLite store for gem/stdlib entries before indexing begins
+      initialize_sqlite_store!
+
       RBSIndexer.new(self).index_ruby_core
       # Calculate how many paths are worth 1% of progress
       progress_step = (uris.length / 100.0).ceil
@@ -378,6 +444,9 @@ module RubyIndexer
         index_file(uri, collect_comments: false)
       end
 
+      # Flush any remaining buffered entries to SQLite
+      flush_sqlite_buffer! if @sqlite_buffer.any?
+
       @initial_indexing_completed = true
     end
 
@@ -390,7 +459,9 @@ module RubyIndexer
       dispatcher.dispatch(result.value)
 
       require_path = uri.require_path
-      @require_paths_tree.insert(require_path, uri) if require_path
+      if require_path && (@initial_indexing_completed || !@sqlite_store || workspace_uri?(uri))
+        @require_paths_tree.insert(require_path, uri)
+      end
 
       indexing_errors = listener.indexing_errors.uniq
       indexing_errors.each { |error| $stderr.puts(error) } if indexing_errors.any?
@@ -432,7 +503,7 @@ module RubyIndexer
           .join("::")
 
         entry = unless seen_names.include?(current_name)
-          @entries[current_name]&.first
+          self[current_name]&.first
         end
 
         case entry
@@ -688,22 +759,28 @@ module RubyIndexer
 
     #: -> bool
     def empty?
-      @entries.empty?
+      @entries.empty? && (@sqlite_store.nil? || @sqlite_store.empty?)
     end
 
     #: -> Array[String]
     def names
-      @entries.keys
+      result = @entries.keys
+      result.concat(@sqlite_store.names) if @sqlite_store
+      result
     end
 
     #: (String name) -> bool
     def indexed?(name)
-      @entries.key?(name)
+      @entries.key?(name) ||
+        @sqlite_buffer.any? { |e| e.name == name } ||
+        (@sqlite_store&.indexed?(name) || false)
     end
 
     #: -> Integer
     def length
-      @entries.count
+      count = @entries.count
+      count += @sqlite_store.length if @sqlite_store
+      count
     end
 
     #: (String name) -> Entry::SingletonClass
@@ -731,13 +808,23 @@ module RubyIndexer
 
     #: [T] (String uri, ?Class[(T & Entry)]? type) -> (Array[Entry] | Array[T])?
     def entries_for(uri, type = nil)
-      entries = @uris_to_entries[uri.to_s]
+      uri_str = uri.to_s
+      entries = @uris_to_entries[uri_str]
+      entries ||= @sqlite_store&.entries_for(uri_str)
       return entries unless type
 
       entries&.grep(type)
     end
 
     private
+
+    # Combined prefix search across in-memory tree and SQLite store
+    #: (String query) -> Array[Array[Entry]]
+    def combined_prefix_search(query)
+      results = @entries_tree.search(query)
+      results.concat(@sqlite_store.prefix_search(query)) if @sqlite_store
+      results
+    end
 
     # Always returns the linearized ancestors for the attached class, regardless of whether `name` refers to a singleton
     # or attached namespace
@@ -920,12 +1007,14 @@ module RubyIndexer
         .name
       resolved_alias = Entry::ConstantAlias.new(target_name, entry)
 
-      # Replace the UnresolvedAlias by a resolved one so that we don't have to do this again later
-      original_entries = @entries[alias_name] #: as !nil
-      original_entries.delete(entry)
-      original_entries << resolved_alias
-
-      @entries_tree.insert(alias_name, original_entries)
+      # Replace the UnresolvedAlias by a resolved one so that we don't have to do this again later.
+      # For entries only in SQLite, we still return the resolved alias but skip caching.
+      original_entries = @entries[alias_name]
+      if original_entries
+        original_entries.delete(entry)
+        original_entries << resolved_alias
+        @entries_tree.insert(alias_name, original_entries)
+      end
 
       resolved_alias
     end
@@ -988,7 +1077,7 @@ module RubyIndexer
         .name
       ancestors = linearized_ancestors_of(namespace_name)
       candidates = ancestors.flat_map do |ancestor_name|
-        @entries_tree.search("#{ancestor_name}::#{constant_name}")
+        combined_prefix_search("#{ancestor_name}::#{constant_name}")
       end
 
       # For candidates with the same name, we must only show the first entry in the inheritance chain, since that's the
@@ -1038,7 +1127,7 @@ module RubyIndexer
     # Tries to return direct entry from index then non seen canonicalized alias or nil
     #: (String full_name, Array[String] seen_names) -> Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]?
     def direct_or_aliased_constant(full_name, seen_names)
-      if (entries = @entries[full_name])
+      if (entries = self[full_name])
         return entries.map do |e|
           e.is_a?(Entry::UnresolvedConstantAlias) ? resolve_alias(e, seen_names) : e
         end #: as Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias])?
@@ -1047,7 +1136,7 @@ module RubyIndexer
       aliased = follow_aliased_namespace(full_name, seen_names)
       return if full_name == aliased || seen_names.include?(aliased)
 
-      @entries[aliased]&.map do |e|
+      self[aliased]&.map do |e|
         e.is_a?(Entry::UnresolvedConstantAlias) ? resolve_alias(e, seen_names) : e
       end #: as Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias])?
     end
@@ -1069,10 +1158,52 @@ module RubyIndexer
         target_method_entries.first, #: as !nil
         entry,
       )
-      original_entries = @entries[new_name] #: as !nil
-      original_entries.delete(entry)
-      original_entries << resolved_alias
+      # Cache the resolved alias in-memory if the entry exists there.
+      # For entries only in SQLite, we still return the resolved alias but skip caching.
+      original_entries = @entries[new_name]
+      if original_entries
+        original_entries.delete(entry)
+        original_entries << resolved_alias
+      end
       resolved_alias
+    end
+
+    #: (URI::Generic uri) -> bool
+    def workspace_uri?(uri)
+      path = uri.full_path
+      return true unless path
+
+      path.start_with?(@configuration.workspace_path)
+    end
+
+    # Initialize the SQLite store for gem/stdlib entries before indexing begins
+    #: -> void
+    def initialize_sqlite_store!
+      db_dir = File.join(Dir.home, ".cache", "ruby-lsp", Digest::SHA1.hexdigest(@configuration.workspace_path))
+      FileUtils.mkdir_p(db_dir)
+      db_path = File.join(db_dir, "index.db")
+      # Remove stale DB from previous runs — persistence will be added later
+      File.delete(db_path) if File.exist?(db_path)
+      @sqlite_store = SQLiteStore.new(db_path)
+    end
+
+    # Flush the buffered gem/stdlib entries to SQLite in a single transaction
+    #: -> void
+    def flush_sqlite_buffer!
+      return unless @sqlite_store
+      return if @sqlite_buffer.empty?
+
+      entries_hash = {} #: Hash[String, Array[Entry]]
+      uris_hash = {} #: Hash[String, Array[Entry]]
+
+      @sqlite_buffer.each do |entry|
+        (entries_hash[entry.name] ||= []) << entry
+        (uris_hash[entry.uri.to_s] ||= []) << entry
+      end
+
+      @sqlite_store.bulk_insert(entries_hash, uris_hash, @require_paths_tree)
+      @sqlite_buffer.clear
+      GC.start
     end
   end
 end

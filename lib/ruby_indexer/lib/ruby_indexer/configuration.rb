@@ -12,7 +12,7 @@ module RubyIndexer
     }.freeze #: Hash[String, untyped]
 
     #: String
-    attr_writer :workspace_path
+    attr_accessor :workspace_path
 
     #: Encoding
     attr_accessor :encoding

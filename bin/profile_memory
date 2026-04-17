@@ -20,7 +20,7 @@ GC.start
 GC.start
 GC.start
 
-# Count and measure entries by type
+# Count and measure entries by type (only in-memory entries remain after SQLite offload)
 entry_counts = Hash.new(0)
 entry_sizes = Hash.new(0)
 total_entries = 0
@@ -32,7 +32,7 @@ ObjectSpace.each_object(RubyIndexer::Entry) do |entry|
   total_entries += 1
 end
 
-puts "=== Entry Objects ==="
+puts "=== In-Memory Entry Objects (workspace only, after SQLite offload) ==="
 puts format("%-35s %8s %12s", "Type", "Count", "Size (KB)")
 puts "-" * 57
 entry_counts.sort_by { |_, count| -count }.each do |type, count|
@@ -42,14 +42,42 @@ puts "-" * 57
 puts format("%-35s %8d %12.1f", "TOTAL", total_entries, entry_sizes.values.sum / 1024.0)
 puts
 
-# PrefixTree nodes
+# SQLite store stats
+sqlite_store = index.instance_variable_get(:@sqlite_store)
+if sqlite_store
+  db = sqlite_store.db
+  sqlite_entry_count = db.get_first_value("SELECT COUNT(*) FROM entries")
+  sqlite_name_count = db.get_first_value("SELECT COUNT(DISTINCT name) FROM entries")
+  sqlite_uri_count = db.get_first_value("SELECT COUNT(DISTINCT uri) FROM entries")
+  sqlite_sig_count = db.get_first_value("SELECT COUNT(*) FROM signatures")
+  sqlite_param_count = db.get_first_value("SELECT COUNT(*) FROM parameters")
+  sqlite_mixin_count = db.get_first_value("SELECT COUNT(*) FROM mixin_operations")
+  sqlite_require_count = db.get_first_value("SELECT COUNT(*) FROM require_paths")
+
+  # SQLite memory usage
+  page_count = db.get_first_value("PRAGMA page_count")
+  page_size = db.get_first_value("PRAGMA page_size")
+  sqlite_db_size = (page_count * page_size) / (1024.0 * 1024)
+
+  puts "=== SQLite Store (gems + stdlib) ==="
+  puts "  Entries:          #{sqlite_entry_count} (#{sqlite_name_count} unique names)"
+  puts "  Files (URIs):     #{sqlite_uri_count}"
+  puts "  Signatures:       #{sqlite_sig_count}"
+  puts "  Parameters:       #{sqlite_param_count}"
+  puts "  Mixin operations: #{sqlite_mixin_count}"
+  puts "  Require paths:    #{sqlite_require_count}"
+  puts "  DB size:          #{sqlite_db_size.round(1)} MB"
+  puts
+end
+
+# PrefixTree nodes (only workspace entries remain)
 node_count = 0
 node_size = 0
 ObjectSpace.each_object(RubyIndexer::PrefixTree::Node) do |node|
   node_count += 1
   node_size += ObjectSpace.memsize_of(node)
 end
-puts "=== PrefixTree ==="
+puts "=== PrefixTree (workspace only) ==="
 puts "  Node count: #{node_count}"
 puts "  Node size:  #{(node_size / 1024.0).round(1)} KB"
 puts
@@ -57,55 +85,25 @@ puts
 # URI objects
 uri_count = 0
 uri_size = 0
-uri_strings = Set.new
 ObjectSpace.each_object(URI::Generic) do |uri|
   uri_count += 1
   uri_size += ObjectSpace.memsize_of(uri)
-  uri_strings << uri.to_s
 end
 puts "=== URI::Generic Objects ==="
-puts "  Total URI objects:  #{uri_count}"
-puts "  Unique URI strings: #{uri_strings.size}"
-puts "  Duplication ratio:  #{uri_count > 0 ? (uri_count.to_f / uri_strings.size).round(1) : 0}x"
-puts "  Total URI size:     #{(uri_size / 1024.0).round(1)} KB"
+puts "  Total URI objects: #{uri_count}"
+puts "  Total URI size:    #{(uri_size / 1024.0).round(1)} KB"
 puts
 
-# Location objects
+# Location objects (only workspace entries remain)
 location_count = 0
 location_size = 0
 ObjectSpace.each_object(RubyIndexer::Location) do |loc|
   location_count += 1
   location_size += ObjectSpace.memsize_of(loc)
 end
-puts "=== Location Objects ==="
+puts "=== Location Objects (workspace only) ==="
 puts "  Count: #{location_count}"
 puts "  Size:  #{(location_size / 1024.0).round(1)} KB"
-puts
-
-# String duplication analysis
-entry_names = []
-owner_names = []
-uri_to_s_values = []
-
-ObjectSpace.each_object(RubyIndexer::Entry) do |entry|
-  entry_names << entry.name
-  if entry.respond_to?(:owner) && entry.owner
-    owner_names << entry.owner.name
-  end
-  uri_to_s_values << entry.uri.to_s
-end
-
-puts "=== String Duplication ==="
-puts "  Entry @name strings:"
-puts "    Total:  #{entry_names.size}"
-puts "    Unique: #{entry_names.uniq.size}"
-puts "    Frozen: #{entry_names.count(&:frozen?)}"
-puts "  Owner names referenced:"
-puts "    Total:  #{owner_names.size}"
-puts "    Unique: #{owner_names.uniq.size}"
-puts "  URI .to_s values:"
-puts "    Total:  #{uri_to_s_values.size}"
-puts "    Unique: #{uri_to_s_values.uniq.size}"
 puts
 
 # Hash overhead
@@ -113,19 +111,20 @@ entries_hash = index.instance_variable_get(:@entries)
 uris_hash = index.instance_variable_get(:@uris_to_entries)
 ancestors_hash = index.instance_variable_get(:@ancestors)
 
-puts "=== Hash Data Structures ==="
+puts "=== In-Memory Hash Data Structures ==="
 puts "  @entries:          #{entries_hash.size} keys, #{(ObjectSpace.memsize_of(entries_hash) / 1024.0).round(1)} KB"
 puts "  @uris_to_entries:  #{uris_hash.size} keys, #{(ObjectSpace.memsize_of(uris_hash) / 1024.0).round(1)} KB"
 puts "  @ancestors:        #{ancestors_hash.size} keys, #{(ObjectSpace.memsize_of(ancestors_hash) / 1024.0).round(1)} KB"
 puts
 
-# Configuration references
-puts "=== Configuration ==="
-puts "  Configuration is now a class-level accessor (no per-entry overhead)"
-puts
-
 # Overall memory
 puts "=== Overall Process Memory ==="
 rss_kb = `ps -o rss= -p #{Process.pid}`.strip.to_i
+# Get peak RSS via rusage
+peak_kb = `ps -o rss= -p #{Process.pid}`.strip.to_i # current RSS as fallback
+if RUBY_PLATFORM.include?("darwin")
+  # macOS: ru_maxrss is in bytes
+  peak_bytes = `/usr/bin/time -l true 2>&1`.match(/(\d+)\s+maximum resident/)&.[](1).to_i rescue 0
+end
 puts "  RSS: #{(rss_kb / 1024.0).round(1)} MB"
 puts "  ObjectSpace total: #{(ObjectSpace.memsize_of_all / (1024.0 * 1024)).round(1)} MB"

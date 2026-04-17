@@ -15,6 +15,7 @@ require "ruby_indexer/lib/ruby_indexer/configuration"
 require "ruby_indexer/lib/ruby_indexer/prefix_tree"
 require "ruby_indexer/lib/ruby_indexer/location"
 require "ruby_indexer/lib/ruby_indexer/rbs_indexer"
+require "ruby_indexer/lib/ruby_indexer/sqlite_store"
 
 module RubyIndexer
 end
