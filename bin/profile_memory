@@ -10,8 +10,10 @@ require_relative "../lib/ruby_lsp/internal"
 ObjectSpace.trace_object_allocations_start
 
 puts "Initializing index..."
+t_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 index = RubyIndexer::Index.new
-index.index_all
+freshly_indexed = index.index_all
+t_end = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
 puts "Index complete. Analyzing memory..."
 puts
@@ -19,6 +21,12 @@ puts
 GC.start
 GC.start
 GC.start
+
+indexing_time = (t_end - t_start).round(2)
+puts "=== Indexing ==="
+puts "  Time:    #{indexing_time}s"
+puts "  Mode:    #{freshly_indexed ? "FRESH (built SQLite DB)" : "CACHED (reused existing SQLite DB)"}"
+puts
 
 # Count and measure entries by type (only in-memory entries remain after SQLite offload)
 entry_counts = Hash.new(0)
@@ -32,7 +40,7 @@ ObjectSpace.each_object(RubyIndexer::Entry) do |entry|
   total_entries += 1
 end
 
-puts "=== In-Memory Entry Objects (workspace only, after SQLite offload) ==="
+puts "=== In-Memory Entry Objects (workspace only) ==="
 puts format("%-35s %8s %12s", "Type", "Count", "Size (KB)")
 puts "-" * 57
 entry_counts.sort_by { |_, count| -count }.each do |type, count|
@@ -54,10 +62,9 @@ if sqlite_store
   sqlite_mixin_count = db.get_first_value("SELECT COUNT(*) FROM mixin_operations")
   sqlite_require_count = db.get_first_value("SELECT COUNT(*) FROM require_paths")
 
-  # SQLite memory usage
-  page_count = db.get_first_value("PRAGMA page_count")
-  page_size = db.get_first_value("PRAGMA page_size")
-  sqlite_db_size = (page_count * page_size) / (1024.0 * 1024)
+  # DB file size on disk
+  db_path = db.filename
+  db_file_size = File.exist?(db_path) ? File.size(db_path) / (1024.0 * 1024) : 0
 
   puts "=== SQLite Store (gems + stdlib) ==="
   puts "  Entries:          #{sqlite_entry_count} (#{sqlite_name_count} unique names)"
@@ -66,7 +73,8 @@ if sqlite_store
   puts "  Parameters:       #{sqlite_param_count}"
   puts "  Mixin operations: #{sqlite_mixin_count}"
   puts "  Require paths:    #{sqlite_require_count}"
-  puts "  DB size:          #{sqlite_db_size.round(1)} MB"
+  puts "  DB file size:     #{db_file_size.round(1)} MB"
+  puts "  DB path:          #{db_path}"
   puts
 end
 
@@ -120,11 +128,5 @@ puts
 # Overall memory
 puts "=== Overall Process Memory ==="
 rss_kb = `ps -o rss= -p #{Process.pid}`.strip.to_i
-# Get peak RSS via rusage
-peak_kb = `ps -o rss= -p #{Process.pid}`.strip.to_i # current RSS as fallback
-if RUBY_PLATFORM.include?("darwin")
-  # macOS: ru_maxrss is in bytes
-  peak_bytes = `/usr/bin/time -l true 2>&1`.match(/(\d+)\s+maximum resident/)&.[](1).to_i rescue 0
-end
-puts "  RSS: #{(rss_kb / 1024.0).round(1)} MB"
-puts "  ObjectSpace total: #{(ObjectSpace.memsize_of_all / (1024.0 * 1024)).round(1)} MB"
+puts "  RSS:             #{(rss_kb / 1024.0).round(1)} MB"
+puts "  ObjectSpace:     #{(ObjectSpace.memsize_of_all / (1024.0 * 1024)).round(1)} MB"
