@@ -428,14 +428,25 @@ module RubyIndexer
           "The index is not empty. To prevent invalid entries, `index_all` can only be called once."
       end
 
-      # Initialize SQLite store for gem/stdlib entries before indexing begins
-      initialize_sqlite_store!
+      # Initialize SQLite store — may reuse existing DB if gems haven't changed
+      gems_reused = initialize_sqlite_store!
 
-      RBSIndexer.new(self).index_ruby_core
+      unless gems_reused
+        # Index Ruby core/stdlib via RBS and gem files into SQLite
+        RBSIndexer.new(self).index_ruby_core
+      end
+
+      # Filter URIs to only workspace files if we're reusing the gem DB
+      workspace_uris = if gems_reused
+        uris.select { |uri| workspace_uri?(uri) }
+      else
+        uris
+      end
+
       # Calculate how many paths are worth 1% of progress
-      progress_step = (uris.length / 100.0).ceil
+      progress_step = (workspace_uris.length / 100.0).ceil
 
-      uris.each_with_index do |uri, index|
+      workspace_uris.each_with_index do |uri, index|
         if block && index % progress_step == 0
           progress = (index / progress_step) + 1
           break unless block.call(progress)
@@ -446,6 +457,9 @@ module RubyIndexer
 
       # Flush any remaining buffered entries to SQLite
       flush_sqlite_buffer! if @sqlite_buffer.any?
+
+      # Store the current lockfile hash for future persistence checks
+      @sqlite_store&.set_metadata("lockfile_hash", compute_lockfile_hash)
 
       @initial_indexing_completed = true
     end
@@ -1176,15 +1190,57 @@ module RubyIndexer
       path.start_with?(@configuration.workspace_path)
     end
 
-    # Initialize the SQLite store for gem/stdlib entries before indexing begins
-    #: -> void
+    # Initialize the SQLite store for gem/stdlib entries before indexing begins.
+    # Returns true if the existing DB was reused (gems haven't changed), false if a fresh DB was created.
+    #: -> bool
     def initialize_sqlite_store!
       db_dir = File.join(Dir.home, ".cache", "ruby-lsp", Digest::SHA1.hexdigest(@configuration.workspace_path))
       FileUtils.mkdir_p(db_dir)
       db_path = File.join(db_dir, "index.db")
-      # Remove stale DB from previous runs — persistence will be added later
-      File.delete(db_path) if File.exist?(db_path)
+
+      current_hash = compute_lockfile_hash
+
+      # Try to reuse existing DB if gems haven't changed
+      if File.exist?(db_path)
+        begin
+          store = SQLiteStore.new(db_path)
+          stored_hash = store.get_metadata("lockfile_hash")
+
+          if stored_hash == current_hash
+            @sqlite_store = store
+            return true
+          end
+
+          # Lockfile changed — drop the stale DB
+          store.close
+        rescue StandardError
+          # Corrupted DB — ignore and recreate
+        end
+
+        File.delete(db_path) if File.exist?(db_path)
+      end
+
       @sqlite_store = SQLiteStore.new(db_path)
+      false
+    end
+
+    # Compute a hash of the current gem lockfile for cache invalidation
+    #: -> String
+    def compute_lockfile_hash
+      lockfile_path = begin
+        Bundler.default_lockfile.to_s
+      rescue Bundler::GemfileNotFound
+        nil
+      end
+
+      content = if lockfile_path && File.exist?(lockfile_path)
+        File.read(lockfile_path)
+      else
+        # Include Ruby version as fallback for stdlib-only projects
+        RUBY_VERSION
+      end
+
+      Digest::SHA1.hexdigest(content)
     end
 
     # Flush the buffered gem/stdlib entries to SQLite in a single transaction

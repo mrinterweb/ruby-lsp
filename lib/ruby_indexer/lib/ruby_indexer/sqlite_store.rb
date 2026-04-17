@@ -243,6 +243,18 @@ module RubyIndexer
       rows.group_by { |r| r["name"] }.map { |name, group| [name, materialize_entries(group)] }
     end
 
+    # Store a metadata key-value pair
+    #: (String key, String value) -> void
+    def set_metadata(key, value)
+      @db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", [key, value])
+    end
+
+    # Retrieve a metadata value
+    #: (String key) -> String?
+    def get_metadata(key)
+      @db.get_first_value("SELECT value FROM metadata WHERE key = ?", [key])
+    end
+
     #: -> void
     def close
       @db.close
