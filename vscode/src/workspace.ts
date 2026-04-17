@@ -171,12 +171,6 @@ export class Workspace implements WorkspaceInterface {
       );
       STATUS_EMITTER.fire(this);
 
-      // Listen for the server requesting a restart after fresh gem indexing to reclaim memory
-      this.lspClient.onNotification("rubyLsp/requestRestart", async (params: { message: string }) => {
-        this.outputChannel.info(params.message);
-        await this.restart();
-      });
-
       // If something triggered a restart while we were still booting, then now we need to perform the restart since the
       // server can now handle shutdown requests
       if (this.needsRestart) {

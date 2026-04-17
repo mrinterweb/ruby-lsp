@@ -159,6 +159,57 @@ if ARGV.include?("--debug")
   end
 end
 
+# Pre-index gems into SQLite in a forked subprocess if the DB doesn't exist or is stale.
+# The fork's memory is fully reclaimed when it exits, so the server process starts with a clean heap.
+unless Gem.win_platform? || reboot
+  begin
+    require "digest/sha1"
+    require "sqlite3"
+
+    db_dir = File.join(Dir.home, ".cache", "ruby-lsp", Digest::SHA1.hexdigest(Dir.pwd))
+    db_path = File.join(db_dir, "index.db")
+
+    # Check if we need to build the DB by comparing lockfile hashes
+    needs_indexing = true
+    if File.exist?(db_path)
+      begin
+        db = SQLite3::Database.new(db_path)
+        db.results_as_hash = true
+        stored_hash = db.get_first_value("SELECT value FROM metadata WHERE key = 'lockfile_hash'")
+        db.close
+
+        lockfile = begin
+          Bundler.default_lockfile.to_s
+        rescue Bundler::GemfileNotFound
+          nil
+        end
+        current_hash = Digest::SHA1.hexdigest(
+          lockfile && File.exist?(lockfile) ? File.read(lockfile) : RUBY_VERSION,
+        )
+
+        needs_indexing = (stored_hash != current_hash)
+      rescue StandardError
+        # Corrupted DB or missing table — will rebuild
+      end
+    end
+
+    if needs_indexing
+      $stderr.puts("Ruby LSP> Pre-indexing gems into SQLite (forked subprocess)...")
+      pid = fork do
+        require "ruby_lsp/internal"
+        index = RubyIndexer::Index.new
+        index.index_all
+        $stderr.puts("Ruby LSP> Pre-indexing complete")
+      end
+      Process.wait(pid)
+      $stderr.puts("Ruby LSP> Pre-indexing subprocess finished")
+    end
+  rescue StandardError => e
+    # If pre-indexing fails, the server will fall back to indexing normally
+    $stderr.puts("Ruby LSP> Pre-indexing failed: #{e.message}")
+  end
+end
+
 initialize_request = JSON.parse(raw_initialize, symbolize_names: true) if raw_initialize
 
 begin
