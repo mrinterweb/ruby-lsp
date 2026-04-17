@@ -105,13 +105,12 @@ module RubyIndexer
                 end
               end
             when Entry::Namespace
-              unless inserted_mixins[entry.name]
-                entry.mixin_operations.each_with_index do |op, pos|
-                  op_type = MIXIN_TYPES[op.class.name] || 0
-                  insert_mixin.execute(entry.name, op_type, op.module_name, pos)
-                end
-                inserted_mixins[entry.name] = true
+              next_pos = inserted_mixins[entry.name] || 0
+              entry.mixin_operations.each_with_index do |op, i|
+                op_type = MIXIN_TYPES[op.class.name] || 0
+                insert_mixin.execute(entry.name, op_type, op.module_name, next_pos + i)
               end
+              inserted_mixins[entry.name] = next_pos + entry.mixin_operations.length
             end
           end
         end
@@ -148,7 +147,11 @@ module RubyIndexer
       return [] if query.empty?
 
       upper = prefix_upper_bound(query)
-      rows = @db.execute("SELECT * FROM entries WHERE name >= ? AND name < ?", [query, upper])
+      singleton_type = ENTRY_TYPES["RubyIndexer::Entry::SingletonClass"]
+      rows = @db.execute(
+        "SELECT * FROM entries WHERE name >= ? AND name < ? AND entry_type != ?",
+        [query, upper, singleton_type],
+      )
       return [] if rows.empty?
 
       # Group by name, return array of arrays
@@ -169,7 +172,11 @@ module RubyIndexer
     def search_require_paths(query)
       upper = prefix_upper_bound(query)
       rows = @db.execute("SELECT * FROM require_paths WHERE path >= ? AND path < ?", [query, upper])
-      rows.map { |r| cached_uri(r["uri"]) }
+      rows.map do |r|
+        uri = cached_uri(r["uri"])
+        uri.require_path ||= r["path"]
+        uri
+      end
     end
 
     # Get all unique entry names
@@ -196,6 +203,15 @@ module RubyIndexer
       length == 0
     end
 
+    # Resolve an UnresolvedConstantAlias to a ConstantAlias in the database
+    #: (String name, String target) -> void
+    def resolve_constant_alias(name, target)
+      @db.execute(
+        "UPDATE entries SET entry_type = ?, target = ? WHERE name = ? AND entry_type = ?",
+        [ENTRY_TYPES["RubyIndexer::Entry::ConstantAlias"], target, name, ENTRY_TYPES["RubyIndexer::Entry::UnresolvedConstantAlias"]],
+      )
+    end
+
     # Update the visibility of an entry in the database
     #: (String name, String uri, Integer start_line, Symbol visibility) -> void
     def update_visibility(name, uri, start_line, visibility)
@@ -209,7 +225,30 @@ module RubyIndexer
     # Delete all entries for a URI
     #: (String uri) -> void
     def delete(uri)
+      # Delete mixin operations for namespace entries in this URI before deleting the entries themselves
+      namespace_names = @db.execute(
+        "SELECT DISTINCT name FROM entries WHERE uri = ? AND entry_type IN (?, ?, ?)",
+        [uri, ENTRY_TYPES["RubyIndexer::Entry::Module"], ENTRY_TYPES["RubyIndexer::Entry::Class"],
+         ENTRY_TYPES["RubyIndexer::Entry::SingletonClass"]],
+      ).map { |r| r["name"] }
+
+      unless namespace_names.empty?
+        placeholders = namespace_names.map { "?" }.join(",")
+        @db.execute("DELETE FROM mixin_operations WHERE entry_name IN (#{placeholders})", namespace_names)
+      end
+
+      # Delete require paths for this URI
+      @db.execute("DELETE FROM require_paths WHERE uri = ?", [uri])
+
+      # Delete entries (cascades to signatures and parameters)
       @db.execute("DELETE FROM entries WHERE uri = ?", [uri])
+    end
+
+    # Delete entries by name (used when moving an entry back to the in-memory buffer for mutation)
+    #: (String name) -> void
+    def delete_entry_by_name(name)
+      @db.execute("DELETE FROM mixin_operations WHERE entry_name = ?", [name])
+      @db.execute("DELETE FROM entries WHERE name = ?", [name])
     end
 
     # Get mixin operations for a namespace
@@ -461,28 +500,27 @@ module RubyIndexer
       comments = row["comments"]
       entry_type = row["entry_type"]
 
-      case entry_type
+      entry = case entry_type
       when 0 # Module
         nesting = row["nesting"] ? JSON.parse(row["nesting"]) : [row["name"]]
-        entry = Entry::Module.new(nesting, uri, location, name_location, comments)
-        load_mixin_operations(entry)
-        entry
+        e = Entry::Module.new(nesting, uri, location, name_location, comments)
+        load_mixin_operations(e)
+        e
       when 1 # Class
         nesting = row["nesting"] ? JSON.parse(row["nesting"]) : [row["name"]]
-        entry = Entry::Class.new(nesting, uri, location, name_location, comments, row["parent_class"])
-        load_mixin_operations(entry)
-        entry
+        e = Entry::Class.new(nesting, uri, location, name_location, comments, row["parent_class"])
+        load_mixin_operations(e)
+        e
       when 2 # SingletonClass
         nesting = row["nesting"] ? JSON.parse(row["nesting"]) : [row["name"]]
-        entry = Entry::SingletonClass.new(nesting, uri, location, name_location, comments, nil)
-        load_mixin_operations(entry)
-        entry
+        e = Entry::SingletonClass.new(nesting, uri, location, name_location, comments, nil)
+        load_mixin_operations(e)
+        e
       when 3 # Method
         signatures = signatures_by_entry[row["id"]] || []
         Entry::Method.new(row["name"], uri, location, name_location, comments, signatures, visibility, row["owner_name"])
       when 4 # Accessor
-        entry = Entry::Accessor.new(row["name"], uri, location, comments, visibility, row["owner_name"])
-        entry
+        Entry::Accessor.new(row["name"], uri, location, comments, visibility, row["owner_name"])
       when 5 # Constant
         Entry::Constant.new(row["name"], uri, location, comments)
       when 6 # GlobalVariable
@@ -495,7 +533,6 @@ module RubyIndexer
         nesting = row["nesting"] ? JSON.parse(row["nesting"]) : []
         Entry::UnresolvedConstantAlias.new(row["target"], nesting, row["name"], uri, location, comments)
       when 10 # ConstantAlias
-        # ConstantAlias needs an UnresolvedConstantAlias to construct, but we can create a minimal one
         unresolved = Entry::UnresolvedConstantAlias.new(row["target"], [], row["name"], uri, location, comments)
         Entry::ConstantAlias.new(row["target"], unresolved)
       when 11 # UnresolvedMethodAlias
@@ -505,6 +542,10 @@ module RubyIndexer
       else
         Entry::Constant.new(row["name"], uri, location, comments)
       end
+
+      # Method and Accessor handle visibility in their constructors; set it for all other types
+      entry.visibility = visibility unless entry_type == 3 || entry_type == 4
+      entry
     end
 
     #: (Entry::Namespace entry) -> void

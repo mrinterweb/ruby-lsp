@@ -718,7 +718,22 @@ module RubyIndexer
     def existing_or_new_singleton_class(name)
       *_namespace, unqualified_name = name.split("::")
       full_singleton_name = "#{name}::<Class:#{unqualified_name}>"
-      singleton = self[full_singleton_name]&.first #: as Entry::SingletonClass?
+
+      # Check the in-memory buffer first to avoid materializing a new object from SQLite,
+      # which would lose any mixin_operations added to the buffered entry
+      singleton = @sqlite_buffer.find { |e| e.is_a?(Entry::SingletonClass) && e.name == full_singleton_name } #: as Entry::SingletonClass?
+
+      unless singleton
+        existing = self[full_singleton_name]&.first #: as Entry::SingletonClass?
+
+        if existing
+          # Move the entry from SQLite back to the buffer so that callers can mutate it
+          # (e.g., adding mixin operations) and the changes will be persisted on the next flush
+          @sqlite_store&.delete_entry_by_name(full_singleton_name)
+          @sqlite_buffer << existing
+          singleton = existing
+        end
+      end
 
       unless singleton
         attached_ancestor = self[name]&.first #: as !nil
@@ -751,6 +766,7 @@ module RubyIndexer
     # Prefix search via SQLite store
     #: (String query) -> Array[Array[Entry]]
     def combined_prefix_search(query)
+      flush_sqlite_buffer! if @sqlite_buffer.any?
       @sqlite_store&.prefix_search(query) || []
     end
 
@@ -928,15 +944,18 @@ module RubyIndexer
       target = resolve(entry.target, entry.nesting, seen_names)
       return entry unless target
 
-      # Self referential alias can be unresolved we should bail out from resolving
-      return entry if target.first == entry
-
       target_name = target.first #: as !nil
         .name
+
+      # Self referential alias can be unresolved we should bail out from resolving.
+      # With SQLite, entries are materialized as new objects on each query, so we compare by name
+      # rather than object identity
+      return entry if target_name == alias_name
       resolved_alias = Entry::ConstantAlias.new(target_name, entry)
 
-      # Note: we don't cache resolved aliases back to SQLite — the resolution is transient.
-      # The next query will re-resolve if needed.
+      # Persist the resolved alias to SQLite so future queries find the ConstantAlias directly
+      @sqlite_store&.resolve_constant_alias(alias_name, target_name)
+
       resolved_alias
     end
 
