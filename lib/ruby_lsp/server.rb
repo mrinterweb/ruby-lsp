@@ -499,7 +499,7 @@ module RubyLsp
           send_log_message("Determined that document should be indexed: #{uri}")
 
           @global_state.index.handle_change(uri) do |index|
-            index.delete(uri, skip_require_paths_tree: true)
+            index.delete(uri)
             RubyIndexer::DeclarationListener.new(index, dispatcher, parse_result, uri, collect_comments: true)
             code_lens = Requests::CodeLens.new(@global_state, document, dispatcher)
             dispatcher.dispatch(document.ast)
@@ -1285,7 +1285,6 @@ module RubyLsp
         if @global_state.client_capabilities.supports_code_lens_refresh
           send_message(Request.new(id: @current_request_id, method: "workspace/codeLens/refresh", params: nil))
         end
-
       end
     end
 

@@ -341,7 +341,7 @@ module RubyIndexer
       # It does not mean the same thing as a Ruby alias.
       any_entries = @index["any?"] #: as Array[Entry::UnresolvedMethodAlias]
 
-      assert_equal(["Array", "Enumerable", "Hash"], any_entries.map { _1.owner_name })
+      assert_equal(["Array", "Enumerable", "Hash"], any_entries.map(&:owner_name))
 
       entry = any_entries.find { |entry| entry.owner_name == "Array" } #: as !nil
 

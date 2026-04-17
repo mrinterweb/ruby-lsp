@@ -2,9 +2,14 @@
 # frozen_string_literal: true
 
 require "sqlite3"
+require "digest/sha1"
+require "fileutils"
 
 module RubyIndexer
   class SQLiteStore
+    # MethodAlias is intentionally absent: its target is a live reference to another Entry and
+    # cannot be serialized. MethodAlias is always produced on-demand by Index#resolve_method_alias
+    # from a stored UnresolvedMethodAlias, never persisted.
     ENTRY_TYPES = {
       "RubyIndexer::Entry::Module" => 0,
       "RubyIndexer::Entry::Class" => 1,
@@ -18,7 +23,6 @@ module RubyIndexer
       "RubyIndexer::Entry::UnresolvedConstantAlias" => 9,
       "RubyIndexer::Entry::ConstantAlias" => 10,
       "RubyIndexer::Entry::UnresolvedMethodAlias" => 11,
-      "RubyIndexer::Entry::MethodAlias" => 12,
     }.freeze #: Hash[String, Integer]
 
     ENTRY_CLASSES = ENTRY_TYPES.invert.freeze #: Hash[Integer, String]
@@ -44,10 +48,43 @@ module RubyIndexer
       "RubyIndexer::Entry::Prepend" => 1,
     }.freeze #: Hash[String, Integer]
 
+    SCHEMA_VERSION = 4 #: Integer
+
     #: SQLite3::Database
     attr_reader :db
 
-    SCHEMA_VERSION = 2 #: Integer
+    class << self
+      # Compute the on-disk cache path for a given workspace. The launcher (before the server
+      # starts) and the server itself must agree on this path or the pre-indexed DB will never
+      # be reused. Always pass the workspace directory as a String path (not a URI).
+      #: (String workspace_path) -> String
+      def db_path_for(workspace_path)
+        db_dir = File.join(Dir.home, ".cache", "ruby-lsp", Digest::SHA1.hexdigest(workspace_path))
+        FileUtils.mkdir_p(db_dir)
+        File.join(db_dir, "index.db")
+      end
+
+      # Hash the current bundle's lockfile to detect gem changes. Both launcher and server run
+      # this after Bundler.setup has activated the composed bundle, so they see the same
+      # `Bundler.default_lockfile`.
+      #: -> String
+      def compute_lockfile_hash
+        lockfile_path = begin
+          Bundler.default_lockfile.to_s
+        rescue Bundler::GemfileNotFound
+          nil
+        end
+
+        content = if lockfile_path && File.exist?(lockfile_path)
+          File.read(lockfile_path)
+        else
+          # Stdlib-only project — fall back to Ruby version so stdlib RBS is still cache-keyed.
+          RUBY_VERSION
+        end
+
+        Digest::SHA1.hexdigest(content)
+      end
+    end
 
     #: (?String? db_path) -> void
     def initialize(db_path = nil)
@@ -61,16 +98,16 @@ module RubyIndexer
       setup_schema
     end
 
-    #: (Hash[String, Array[Entry]] entries, Hash[String, Array[Entry]] uris_to_entries, untyped? _require_paths_tree) -> void
-    def bulk_insert(entries, uris_to_entries, _require_paths_tree = nil)
+    #: (Hash[String, Array[Entry]] entries, Array[[String, String]] require_paths) -> void
+    def bulk_insert(entries, require_paths)
       @db.transaction do
         insert_entry = @db.prepare(<<~SQL)
           INSERT INTO entries (
-            name, entry_type, uri, visibility,
+            name, short_name, entry_type, uri, visibility,
             start_line, end_line, start_column, end_column,
             name_start_line, name_end_line, name_start_column, name_end_column,
             owner_name, parent_class, target, nesting, old_name, comments
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         SQL
 
         insert_signature = @db.prepare(<<~SQL)
@@ -82,15 +119,16 @@ module RubyIndexer
         SQL
 
         insert_mixin = @db.prepare(<<~SQL)
-          INSERT INTO mixin_operations (entry_name, operation_type, module_name, position) VALUES (?, ?, ?, ?)
+          INSERT INTO mixin_operations (entry_name, uri, operation_type, module_name, position) VALUES (?, ?, ?, ?, ?)
         SQL
 
         insert_require_path = @db.prepare(<<~SQL)
           INSERT OR REPLACE INTO require_paths (path, uri) VALUES (?, ?)
         SQL
 
-        # Track which namespace names we've already inserted mixins for
-        inserted_mixins = {} #: Hash[String, Integer]
+        # Track the next insertion position per (entry_name, uri) so that multiple buffered
+        # entries for the same namespace in the same file keep their mixin ops in source order.
+        inserted_mixins = {} #: Hash[[String, String], Integer]
 
         entries.each_value do |entry_list|
           entry_list.each do |entry|
@@ -108,23 +146,22 @@ module RubyIndexer
                 end
               end
             when Entry::Namespace
-              next_pos = inserted_mixins[entry.name] || 0
+              entry_uri = entry.uri.to_s
+              key = [entry.name, entry_uri]
+              next_pos = inserted_mixins[key] || 0
               entry.mixin_operations.each_with_index do |op, i|
                 op_type = MIXIN_TYPES[op.class.name] || 0
-                insert_mixin.execute(entry.name, op_type, op.module_name, next_pos + i)
+                insert_mixin.execute(entry.name, entry_uri, op_type, op.module_name, next_pos + i)
               end
-              inserted_mixins[entry.name] = next_pos + entry.mixin_operations.length
+              inserted_mixins[key] = next_pos + entry.mixin_operations.length
             end
           end
         end
 
-        # Insert require paths by scanning uris_to_entries for URIs that have require_path
-        uris_to_entries.each_value do |entry_list|
-          uri = entry_list.first&.uri
-          next unless uri
-
-          require_path = uri.require_path
-          insert_require_path.execute(require_path, uri.to_s) if require_path
+        # Insert require paths explicitly recorded during indexing. We track them per-URI
+        # (not per-entry) so empty files still register their require_path.
+        require_paths.each do |path, uri_str|
+          insert_require_path.execute(path, uri_str)
         end
 
         insert_entry.close
@@ -144,7 +181,10 @@ module RubyIndexer
       materialize_entries(rows)
     end
 
-    # Prefix search for autocompletion
+    # Prefix search for autocompletion.
+    # Results are ordered by name ASC so that shorter names (which are lexicographically less
+    # than any extension with a longer suffix) appear before their extensions — matching the
+    # in-memory PrefixTree's "leaf-before-descendants" collect behavior that callers rely on.
     #: (String query) -> Array[Array[Entry]]
     def prefix_search(query)
       return [] if query.empty?
@@ -152,12 +192,12 @@ module RubyIndexer
       upper = prefix_upper_bound(query)
       singleton_type = ENTRY_TYPES["RubyIndexer::Entry::SingletonClass"]
       rows = @db.execute(
-        "SELECT * FROM entries WHERE name >= ? AND name < ? AND entry_type != ?",
+        "SELECT * FROM entries WHERE name >= ? AND name < ? AND entry_type != ? ORDER BY name ASC, id ASC",
         [query, upper, singleton_type],
       )
       return [] if rows.empty?
 
-      # Group by name, return array of arrays
+      # group_by is stable, so the resulting groups follow the first-row-per-name order above.
       rows.group_by { |r| r["name"] }.map { |_name, group| materialize_entries(group) }
     end
 
@@ -225,76 +265,45 @@ module RubyIndexer
       )
     end
 
-    # Delete all entries for a URI
+    # Delete all entries (and their owned rows) for a URI. Mixin operations are scoped by URI
+    # so that re-indexing one file doesn't clobber mixin ops contributed by a different file
+    # to the same namespace (e.g., a singleton reopened in multiple files).
     #: (String uri) -> void
     def delete(uri)
-      # Delete mixin operations for namespace entries in this URI before deleting the entries themselves
-      namespace_names = @db.execute(
-        "SELECT DISTINCT name FROM entries WHERE uri = ? AND entry_type IN (?, ?, ?)",
-        [uri, ENTRY_TYPES["RubyIndexer::Entry::Module"], ENTRY_TYPES["RubyIndexer::Entry::Class"],
-         ENTRY_TYPES["RubyIndexer::Entry::SingletonClass"]],
-      ).map { |r| r["name"] }
-
-      unless namespace_names.empty?
-        placeholders = namespace_names.map { "?" }.join(",")
-        @db.execute("DELETE FROM mixin_operations WHERE entry_name IN (#{placeholders})", namespace_names)
-      end
-
-      # Delete require paths for this URI
+      @db.execute("DELETE FROM mixin_operations WHERE uri = ?", [uri])
       @db.execute("DELETE FROM require_paths WHERE uri = ?", [uri])
-
-      # Delete entries (cascades to signatures and parameters)
+      # Entries cascade to signatures and parameters via foreign keys
       @db.execute("DELETE FROM entries WHERE uri = ?", [uri])
-
-      # Remove mtime tracking
       @db.execute("DELETE FROM indexed_files WHERE uri = ?", [uri])
     end
 
-    # Delete entries by name (used when moving an entry back to the in-memory buffer for mutation)
-    #: (String name) -> void
-    def delete_entry_by_name(name)
-      @db.execute("DELETE FROM mixin_operations WHERE entry_name = ?", [name])
-      @db.execute("DELETE FROM entries WHERE name = ?", [name])
-    end
-
-    # Get mixin operations for a namespace
-    #: (String entry_name) -> Array[Entry::ModuleOperation]
-    def mixin_operations_for(entry_name)
-      rows = @db.execute(
-        "SELECT * FROM mixin_operations WHERE entry_name = ? ORDER BY position",
-        [entry_name],
-      )
-
-      rows.map do |row|
-        if row["operation_type"] == 0
-          Entry::Include.new(row["module_name"])
-        else
-          Entry::Prepend.new(row["module_name"])
-        end
-      end
-    end
-
-    # Find first unqualified constant match
+    # Find the first entry whose full name equals `name` or whose last `::`-separated segment
+    # equals `name`. Uses the indexed short_name column so the lookup stays O(log n) instead of
+    # the full-table scan that `LIKE '%::name'` forces (leading wildcard disables the index).
     #: (String name) -> Array[Entry]?
     def first_unqualified_const(name)
-      # Try exact match or ending with ::name
       rows = @db.execute(
-        "SELECT * FROM entries WHERE name = ? OR name LIKE ? LIMIT 50",
-        [name, "%::#{name}"],
+        "SELECT * FROM entries WHERE name = ? OR short_name = ? ORDER BY id LIMIT 50",
+        [name, name],
       )
-      return materialize_entries(rows) if rows.any?
+      return if rows.empty?
 
-      # Try ending with name
-      rows = @db.execute("SELECT * FROM entries WHERE name LIKE ? LIMIT 50", ["%#{name}"])
-      return materialize_entries(rows) if rows.any?
-
-      nil
+      materialize_entries(rows)
     end
 
     # Get all entry names matching a fuzzy query (returns just names for Jaro-Winkler filtering in Ruby)
-    #: -> Array[[String, Array[Entry]]]
-    def all_entries_with_names
-      rows = @db.execute("SELECT * FROM entries")
+    # Get all entries grouped by name. Callers that only need non-singleton entries can pass
+    # exclude_singletons: true so the SingletonClass filter happens in SQL instead of after
+    # materializing every row — a measurable win for large gem indexes where every class has a
+    # companion singleton class.
+    #: (?exclude_singletons: bool) -> Array[[String, Array[Entry]]]
+    def all_entries_with_names(exclude_singletons: false)
+      rows = if exclude_singletons
+        singleton_type = ENTRY_TYPES["RubyIndexer::Entry::SingletonClass"]
+        @db.execute("SELECT * FROM entries WHERE entry_type != ?", [singleton_type])
+      else
+        @db.execute("SELECT * FROM entries")
+      end
       rows.group_by { |r| r["name"] }.map { |name, group| [name, materialize_entries(group)] }
     end
 
@@ -333,7 +342,12 @@ module RubyIndexer
     # Drop all tables if schema version has changed, forcing a full rebuild
     #: -> void
     def migrate_if_needed
-      current = @db.get_first_value("SELECT value FROM metadata WHERE key = 'schema_version'") rescue nil
+      current = begin
+        @db.get_first_value("SELECT value FROM metadata WHERE key = 'schema_version'")
+      rescue SQLite3::SQLException
+        # metadata table doesn't exist yet — fresh DB
+        nil
+      end
       return if current.to_i == SCHEMA_VERSION
 
       @db.execute_batch(<<~SQL)
@@ -353,6 +367,7 @@ module RubyIndexer
         CREATE TABLE IF NOT EXISTS entries (
           id INTEGER PRIMARY KEY,
           name TEXT NOT NULL,
+          short_name TEXT NOT NULL,
           entry_type INTEGER NOT NULL,
           uri TEXT NOT NULL,
           visibility INTEGER NOT NULL DEFAULT 0,
@@ -373,6 +388,7 @@ module RubyIndexer
         );
 
         CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);
+        CREATE INDEX IF NOT EXISTS idx_entries_short_name ON entries(short_name);
         CREATE INDEX IF NOT EXISTS idx_entries_uri ON entries(uri);
         CREATE INDEX IF NOT EXISTS idx_entries_owner ON entries(owner_name);
 
@@ -402,12 +418,14 @@ module RubyIndexer
         CREATE TABLE IF NOT EXISTS mixin_operations (
           id INTEGER PRIMARY KEY,
           entry_name TEXT NOT NULL,
+          uri TEXT NOT NULL,
           operation_type INTEGER NOT NULL,
           module_name TEXT NOT NULL,
           position INTEGER NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_mixin_entry ON mixin_operations(entry_name);
+        CREATE INDEX IF NOT EXISTS idx_mixin_uri ON mixin_operations(uri);
 
         CREATE TABLE IF NOT EXISTS require_paths (
           path TEXT PRIMARY KEY,
@@ -427,7 +445,9 @@ module RubyIndexer
 
     #: (SQLite3::Statement stmt, Entry entry) -> Integer
     def insert_single_entry(stmt, entry)
-      entry_type = ENTRY_TYPES[entry.class.name] || 0
+      entry_type = ENTRY_TYPES[entry.class.name]
+      raise ArgumentError, "Cannot persist #{entry.class.name} — no mapping in ENTRY_TYPES" unless entry_type
+
       visibility = VISIBILITY_MAP[entry.visibility] || 0
       loc = entry.location
       uri_str = entry.uri.to_s
@@ -460,12 +480,14 @@ module RubyIndexer
       # Old name (for UnresolvedMethodAlias)
       old_name = entry.old_name if entry.is_a?(Entry::UnresolvedMethodAlias)
 
-      # Skip eager comment loading — comments are expensive to parse (re-reads each file).
-      # They'll be lazily loaded from disk when materialized entries are accessed.
+      # Persist whatever was already collected. Gem entries are indexed with
+      # collect_comments: false so @comments is nil for them — Entry#comments then lazily parses
+      # the file on first access. RBS and workspace entries have a non-nil string to persist.
       comments = entry.instance_variable_get(:@comments)
 
       stmt.execute(
         entry.name,
+        short_name_for(entry.name),
         entry_type,
         uri_str,
         visibility,
@@ -488,48 +510,84 @@ module RubyIndexer
       @db.last_insert_row_id
     end
 
-    #: (Array[Hash[String, untyped]] rows) -> Array[Entry]
-    def materialize_entries(rows)
-      # Collect entry IDs for Method entries to batch-load signatures
-      method_ids = []
-      rows.each do |row|
-        method_ids << row["id"] if row["entry_type"] == ENTRY_TYPES["RubyIndexer::Entry::Method"]
-      end
-
-      # Batch load signatures and parameters for all Method entries
-      signatures_by_entry = {}
-      unless method_ids.empty?
-        placeholders = method_ids.map { "?" }.join(",")
-        sig_rows = @db.execute(
-          "SELECT * FROM signatures WHERE entry_id IN (#{placeholders}) ORDER BY entry_id, position",
-          method_ids,
-        )
-        sig_ids = sig_rows.map { |r| r["id"] }
-
-        params_by_sig = {}
-        unless sig_ids.empty?
-          param_placeholders = sig_ids.map { "?" }.join(",")
-          param_rows = @db.execute(
-            "SELECT * FROM parameters WHERE signature_id IN (#{param_placeholders}) ORDER BY signature_id, position",
-            sig_ids,
-          )
-          param_rows.each do |pr|
-            (params_by_sig[pr["signature_id"]] ||= []) << pr
-          end
-        end
-
-        sig_rows.each do |sr|
-          sig_params = (params_by_sig[sr["id"]] || []).map { |pr| materialize_parameter(pr) }
-          signature = Entry::Signature.new(sig_params)
-          (signatures_by_entry[sr["entry_id"]] ||= []) << signature
-        end
-      end
-
-      rows.map { |row| materialize_single_entry(row, signatures_by_entry) }
+    # Extract the last `::`-separated segment of a fully qualified name so we can index it.
+    # Used by first_unqualified_const to turn a "find `Foo`, wherever nested" lookup into an
+    # indexed equality match rather than a full table scan via LIKE '%::Foo'.
+    #: (String name) -> String
+    def short_name_for(name)
+      idx = name.rindex("::")
+      idx ? name[(idx + 2)..] || name : name
     end
 
-    #: (Hash[String, untyped] row, Hash[Integer, Array[Entry::Signature]] signatures_by_entry) -> Entry
-    def materialize_single_entry(row, signatures_by_entry)
+    #: (Array[Hash[String, untyped]] rows) -> Array[Entry]
+    def materialize_entries(rows)
+      signatures_by_entry = batch_load_signatures(rows)
+      mixin_ops_by_name = batch_load_mixin_operations(rows)
+      rows.map { |row| materialize_single_entry(row, signatures_by_entry, mixin_ops_by_name) }
+    end
+
+    # Load all signatures (and their parameters) for Method rows in at most two queries.
+    #: (Array[Hash[String, untyped]] rows) -> Hash[Integer, Array[Entry::Signature]]
+    def batch_load_signatures(rows)
+      method_type = ENTRY_TYPES["RubyIndexer::Entry::Method"]
+      method_ids = rows.filter_map { |row| row["id"] if row["entry_type"] == method_type }
+      return {} if method_ids.empty?
+
+      placeholders = method_ids.map { "?" }.join(",")
+      sig_rows = @db.execute(
+        "SELECT * FROM signatures WHERE entry_id IN (#{placeholders}) ORDER BY entry_id, position",
+        method_ids,
+      )
+      sig_ids = sig_rows.map { |r| r["id"] }
+
+      params_by_sig = {} #: Hash[Integer, Array[Hash[String, untyped]]]
+      unless sig_ids.empty?
+        param_placeholders = sig_ids.map { "?" }.join(",")
+        param_rows = @db.execute(
+          "SELECT * FROM parameters WHERE signature_id IN (#{param_placeholders}) ORDER BY signature_id, position",
+          sig_ids,
+        )
+        param_rows.each { |pr| (params_by_sig[pr["signature_id"]] ||= []) << pr }
+      end
+
+      signatures_by_entry = {} #: Hash[Integer, Array[Entry::Signature]]
+      sig_rows.each do |sr|
+        sig_params = (params_by_sig[sr["id"]] || []).map { |pr| materialize_parameter(pr) }
+        (signatures_by_entry[sr["entry_id"]] ||= []) << Entry::Signature.new(sig_params)
+      end
+      signatures_by_entry
+    end
+
+    # Load mixin operations for every namespace row in a single query, keyed by entry name so
+    # reopens across URIs aggregate naturally. Previously this was an N+1 query per materialized
+    # namespace, which dominated prefix_search that returned many classes/modules.
+    #: (Array[Hash[String, untyped]] rows) -> Hash[String, Array[Entry::ModuleOperation]]
+    def batch_load_mixin_operations(rows)
+      namespace_types = [
+        ENTRY_TYPES["RubyIndexer::Entry::Module"],
+        ENTRY_TYPES["RubyIndexer::Entry::Class"],
+        ENTRY_TYPES["RubyIndexer::Entry::SingletonClass"],
+      ]
+      namespace_names = rows.filter_map { |row| row["name"] if namespace_types.include?(row["entry_type"]) }.uniq
+      return {} if namespace_names.empty?
+
+      placeholders = namespace_names.map { "?" }.join(",")
+      mixin_rows = @db.execute(
+        "SELECT entry_name, operation_type, module_name FROM mixin_operations " \
+          "WHERE entry_name IN (#{placeholders}) ORDER BY entry_name, uri, position",
+        namespace_names,
+      )
+
+      ops_by_name = {} #: Hash[String, Array[Entry::ModuleOperation]]
+      mixin_rows.each do |mr|
+        op = mr["operation_type"] == 0 ? Entry::Include.new(mr["module_name"]) : Entry::Prepend.new(mr["module_name"])
+        (ops_by_name[mr["entry_name"]] ||= []) << op
+      end
+      ops_by_name
+    end
+
+    #: (Hash[String, untyped] row, Hash[Integer, Array[Entry::Signature]] signatures_by_entry, Hash[String, Array[Entry::ModuleOperation]] mixin_ops_by_name) -> Entry
+    def materialize_single_entry(row, signatures_by_entry, mixin_ops_by_name)
       uri = cached_uri(row["uri"])
       location = Location.new(row["start_line"], row["end_line"], row["start_column"], row["end_column"])
 
@@ -547,17 +605,17 @@ module RubyIndexer
       when 0 # Module
         nesting = row["nesting"] ? JSON.parse(row["nesting"]) : [row["name"]]
         e = Entry::Module.new(nesting, uri, location, name_location, comments)
-        load_mixin_operations(e)
+        apply_mixin_operations(e, mixin_ops_by_name[row["name"]])
         e
       when 1 # Class
         nesting = row["nesting"] ? JSON.parse(row["nesting"]) : [row["name"]]
         e = Entry::Class.new(nesting, uri, location, name_location, comments, row["parent_class"])
-        load_mixin_operations(e)
+        apply_mixin_operations(e, mixin_ops_by_name[row["name"]])
         e
       when 2 # SingletonClass
         nesting = row["nesting"] ? JSON.parse(row["nesting"]) : [row["name"]]
-        e = Entry::SingletonClass.new(nesting, uri, location, name_location, comments, nil)
-        load_mixin_operations(e)
+        e = Entry::SingletonClass.new(nesting, uri, location, name_location, comments, row["parent_class"])
+        apply_mixin_operations(e, mixin_ops_by_name[row["name"]])
         e
       when 3 # Method
         signatures = signatures_by_entry[row["id"]] || []
@@ -580,8 +638,6 @@ module RubyIndexer
         Entry::ConstantAlias.new(row["target"], unresolved)
       when 11 # UnresolvedMethodAlias
         Entry::UnresolvedMethodAlias.new(row["name"], row["old_name"], row["owner_name"], uri, location, comments)
-      when 12 # MethodAlias — stored as unresolved since target is a live reference
-        Entry::UnresolvedMethodAlias.new(row["name"], row["old_name"] || row["name"], row["owner_name"], uri, location, comments)
       else
         Entry::Constant.new(row["name"], uri, location, comments)
       end
@@ -591,9 +647,10 @@ module RubyIndexer
       entry
     end
 
-    #: (Entry::Namespace entry) -> void
-    def load_mixin_operations(entry)
-      ops = mixin_operations_for(entry.name)
+    #: (Entry::Namespace entry, Array[Entry::ModuleOperation]? ops) -> void
+    def apply_mixin_operations(entry, ops)
+      return unless ops
+
       ops.each { |op| entry.mixin_operations << op }
     end
 
@@ -614,12 +671,28 @@ module RubyIndexer
     end
 
     # Compute the upper bound for a prefix range query.
-    # "Foo" -> "Fop" (increment last character)
+    # SQLite's default BINARY collation compares TEXT byte-by-byte, so we operate on bytes rather
+    # than characters. This avoids producing invalid UTF-8 (e.g., surrogates) or relying on code
+    # point arithmetic that doesn't line up with byte-wise comparison for multi-byte characters.
+    #
+    # The result is force-encoded back to UTF-8 (the bytes remain unchanged) so that the sqlite3
+    # gem binds the parameter as TEXT. Binding as BLOB would collide with SQLite's type affinity
+    # rules — every TEXT value compares less than any BLOB — which would cause the upper-bound
+    # predicate `name < ?` to match every row.
     #: (String prefix) -> String
     def prefix_upper_bound(prefix)
       return prefix if prefix.empty?
 
-      prefix[0..-2] + (prefix[-1].ord + 1).chr(Encoding::UTF_8)
+      bytes = prefix.bytes
+      i = bytes.length - 1
+      i -= 1 while i >= 0 && bytes[i] == 0xFF
+
+      # If every byte is 0xFF there is no strict upper bound in byte-lexicographic order; fall back
+      # to a long sentinel. Ruby identifier names never start with 0xFF bytes in practice.
+      return (prefix + ("\xFF".b * 32)).force_encoding(Encoding::UTF_8) if i < 0
+
+      bytes[i] += 1
+      bytes[0..i].pack("C*").force_encoding(Encoding::UTF_8)
     end
 
     #: (String uri_string) -> URI::Generic

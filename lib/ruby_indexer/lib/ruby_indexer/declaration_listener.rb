@@ -132,15 +132,17 @@ module RubyIndexer
         name = (expression.is_a?(Prism::SelfNode) ? "<Class:#{last_name_in_stack}>" : "<Class:#{expression.slice}>")
         real_nesting = Index.actual_nesting(@stack, name)
 
-        existing_entries = @index[real_nesting.join("::")] #: as Array[Entry::SingletonClass]?
-
-        if existing_entries
-          entry = existing_entries.first #: as !nil
-          entry.update_singleton_information(
+        # Only consider a buffered entry — materialized entries from SQLite cannot be mutated in
+        # place. If this file has already buffered the same singleton (nested reopens), update it;
+        # otherwise create a fresh per-file entry so each file carries its own location info.
+        buffered = @index.find_buffered_namespace(real_nesting.join("::"))
+        if buffered.is_a?(Entry::SingletonClass)
+          buffered.update_singleton_information(
             Location.from_prism_location(node.location, @code_units_cache),
             Location.from_prism_location(expression.location, @code_units_cache),
             collect_comments(node),
           )
+          entry = buffered
         else
           entry = Entry::SingletonClass.new(
             real_nesting,
@@ -150,7 +152,7 @@ module RubyIndexer
             collect_comments(node),
             nil,
           )
-          @index.add(entry, skip_prefix_tree: true)
+          @index.add(entry)
         end
 
         @owner_stack << entry

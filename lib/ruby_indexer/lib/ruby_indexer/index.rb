@@ -62,10 +62,31 @@ module RubyIndexer
       @configuration = RubyIndexer::Configuration.new #: Configuration
       Entry.configuration = @configuration
 
-      @sqlite_store = nil #: SQLiteStore?
+      # Always eagerly open an in-memory store. `index_all` replaces this with an on-disk store
+      # keyed on the workspace path; tests and other callers that add entries directly (without
+      # going through `index_all`) can still flush and query without an explicit init step.
+      @sqlite_store = SQLiteStore.new #: SQLiteStore
       @sqlite_buffer = [] #: Array[Entry]
       @sqlite_buffer_size = 5000 #: Integer
-      @writer_fiber = nil #: Fiber?
+      # (require_path, uri_string) pairs pending a SQLite flush. Tracked separately from the
+      # entries buffer so empty files (ones that declare nothing but are still require-able)
+      # still contribute to require-path completion.
+      @require_paths_buffer = [] #: Array[[String, String]]
+
+      # Name-keyed lookup into the buffer for Namespace entries. Avoids O(buffer) scans when the
+      # indexer needs to find an in-progress namespace (e.g., existing_or_new_singleton_class).
+      # Only one entry per name is kept — the most recently added. That's sufficient because the
+      # only callers that care about identity pass by name and we never re-enter the buffer for a
+      # flushed entry (materialized entries are never placed back into the buffer).
+      @buffered_namespaces_by_name = {} #: Hash[String, Entry::Namespace]
+
+      # Cache of resolved method aliases. MethodAlias entries can't be persisted to SQLite
+      # because their `target` is a live reference to another Entry. We cache them in memory
+      # so that once `resolve_method_alias` has materialized a MethodAlias, subsequent `[]`
+      # lookups return the resolved form instead of the stored UnresolvedMethodAlias. Keyed by
+      # alias name; multiple entries allowed because the same alias name can appear under
+      # different owners.
+      @resolved_method_aliases = {} #: Hash[String, Array[Entry::MethodAlias]]
 
       @initial_indexing_completed = false #: bool
     end
@@ -76,18 +97,27 @@ module RubyIndexer
       (@included_hooks[module_name] ||= []) << hook
     end
 
-    #: (URI::Generic uri, ?skip_require_paths_tree: bool) -> void
-    def delete(uri, skip_require_paths_tree: false)
+    #: (URI::Generic uri) -> void
+    def delete(uri)
       @sqlite_store&.delete(uri.to_s)
     end
 
-    #: (Entry entry, ?skip_prefix_tree: bool) -> void
-    def add(entry, skip_prefix_tree: false)
+    #: (Entry entry) -> void
+    def add(entry)
       @sqlite_buffer << entry
+      @buffered_namespaces_by_name[entry.name] = entry if entry.is_a?(Entry::Namespace)
 
       if @sqlite_buffer.length >= @sqlite_buffer_size
         flush_sqlite_buffer!
       end
+    end
+
+    # Return the in-progress namespace entry currently buffered for `name`, or nil if there isn't
+    # one. Callers use this to find an entry that can still be safely mutated (e.g., updating a
+    # SingletonClass's location info) without having to flush and re-materialize from SQLite.
+    #: (String name) -> Entry::Namespace?
+    def find_buffered_namespace(name)
+      @buffered_namespaces_by_name[name]
     end
 
     # Update the visibility of an entry and persist the change to SQLite
@@ -99,14 +129,27 @@ module RubyIndexer
 
     #: (String fully_qualified_name) -> Array[Entry]?
     def [](fully_qualified_name)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       name = fully_qualified_name.start_with?("::") ? fully_qualified_name.delete_prefix("::") : fully_qualified_name
-      @sqlite_store&.[](name)
+      entries = @sqlite_store&.[](name)
+
+      # Overlay previously-resolved method aliases. For each resolved MethodAlias, replace the
+      # matching UnresolvedMethodAlias (same owner) so callers see the resolved target without
+      # re-resolving every time.
+      resolved = @resolved_method_aliases[name]
+      return entries unless resolved && !resolved.empty?
+
+      base = entries || []
+      by_owner = resolved.each_with_object({}) { |a, h| h[a.owner_name] = a }
+      base = base.reject do |e|
+        e.is_a?(Entry::UnresolvedMethodAlias) && by_owner.key?(e.owner_name)
+      end
+      base + resolved
     end
 
     #: (String query) -> Array[URI::Generic]
     def search_require_paths(query)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       @sqlite_store&.search_require_paths(query) || []
     end
 
@@ -114,7 +157,7 @@ module RubyIndexer
     # there are more possible matching entries
     #: (String name) -> Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]?
     def first_unqualified_const(name)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       @sqlite_store&.first_unqualified_const(name) #: as Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]?
     end
 
@@ -133,13 +176,12 @@ module RubyIndexer
     # ```
     #: (String query, ?Array[String]? nesting) -> Array[Array[Entry]]
     def prefix_search(query, nesting = nil)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       return [] unless @sqlite_store
 
       unless nesting
-        results = @sqlite_store.prefix_search(query)
-        results.uniq!
-        return results
+        # A single call to SQLiteStore#prefix_search already groups by name, so no dedup needed.
+        return @sqlite_store.prefix_search(query)
       end
 
       results = nesting.length.downto(0).flat_map do |i|
@@ -149,32 +191,29 @@ module RubyIndexer
         @sqlite_store.prefix_search(namespaced_query)
       end
 
-      results.uniq!
-      results
+      # Dedup by the group's name: materialized entries are fresh objects every call, so plain
+      # `uniq!` (which uses ==) can't collapse the same name appearing from multiple prefix
+      # searches (e.g., a nested constant that matches several nesting-prefixed queries).
+      dedup_groups_by_name(results)
     end
 
     # Fuzzy searches index entries based on Jaro-Winkler similarity. If no query is provided, all entries are returned
     #: (String? query) ?{ (Entry) -> bool? } -> Array[Entry]
     def fuzzy_search(query, &condition)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       return [] unless @sqlite_store
 
+      all_entries = @sqlite_store.all_entries_with_names(exclude_singletons: true)
+
       unless query
-        entries = @sqlite_store.all_entries_with_names.filter_map do |_name, sqlite_entries|
-          next if sqlite_entries.first.is_a?(Entry::SingletonClass)
-
-          sqlite_entries = sqlite_entries.select(&condition) if condition
-          sqlite_entries unless sqlite_entries.empty?
+        return all_entries.flat_map do |_name, sqlite_entries|
+          condition ? sqlite_entries.select(&condition) : sqlite_entries
         end
-
-        return entries.flatten
       end
 
       normalized_query = query.gsub("::", "").downcase
 
-      results = @sqlite_store.all_entries_with_names.filter_map do |name, sqlite_entries|
-        next if sqlite_entries.first.is_a?(Entry::SingletonClass)
-
+      results = all_entries.filter_map do |name, sqlite_entries|
         sqlite_entries = sqlite_entries.select(&condition) if condition
         next if sqlite_entries.empty?
 
@@ -190,10 +229,13 @@ module RubyIndexer
     def method_completion_candidates(name, receiver_name)
       ancestors = linearized_ancestors_of(receiver_name)
 
-      candidates = if name
+      # Treat empty string the same as nil — callers pass `""` when Prism's call node has no
+      # message yet (e.g., the user just typed `Foo.` and there's no method name). In that case
+      # we want the full set of candidates, not a prefix search for "".
+      candidates = if name && !name.empty?
         prefix_search(name).flatten
       elsif @sqlite_store
-        @sqlite_store.all_entries_with_names.flat_map(&:last)
+        @sqlite_store.all_entries_with_names(exclude_singletons: true).flat_map(&:last)
       else
         []
       end
@@ -275,8 +317,7 @@ module RubyIndexer
         definitions.any?
       end
 
-      entries.uniq!
-      entries #: as Array[Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]]
+      dedup_groups_by_name(entries) #: as Array[Array[Entry::Constant | Entry::ConstantAlias | Entry::Namespace | Entry::UnresolvedConstantAlias]]
     end
 
     # Resolve a constant to its declaration based on its name and the nesting where the reference was found. Parameter
@@ -348,16 +389,6 @@ module RubyIndexer
         uris
       end
 
-      # Create a fiber-based writer that flushes entries to SQLite in the background.
-      # The main fiber parses files, the writer fiber handles SQLite I/O between files.
-      @writer_fiber = Fiber.new do
-        loop do
-          Fiber.yield # Wait for entries to accumulate
-          flush_sqlite_buffer! if @sqlite_buffer.length >= @sqlite_buffer_size
-        end
-      end
-      @writer_fiber.resume # Initialize the fiber
-
       # Calculate how many paths are worth 1% of progress
       progress_step = (indexable_uris.length / 100.0).ceil
 
@@ -389,15 +420,11 @@ module RubyIndexer
         end
 
         index_file(uri, collect_comments: false)
-
-        # Yield to the writer fiber to flush if buffer is full
-        @writer_fiber.resume if @writer_fiber.alive?
+        # add() flushes automatically once the buffer hits @sqlite_buffer_size.
       end
 
-      @writer_fiber = nil
-
       # Flush any remaining buffered entries to SQLite
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
 
       # Record mtimes for all files we indexed
       indexed_file_uris.each { |uri_str, mtime| @sqlite_store&.set_file_mtime(uri_str, mtime) }
@@ -417,7 +444,18 @@ module RubyIndexer
       listener = DeclarationListener.new(self, dispatcher, result, uri, collect_comments: collect_comments)
       dispatcher.dispatch(result.value)
 
-      # Require paths are stored in SQLite via the bulk_insert flush
+      # Record the require_path for this URI independently of whether the file declared any
+      # entries. Empty require-able files (e.g., gem entrypoints that just reopen a namespace
+      # in another file) still need to show up in require-path completion.
+      #
+      # Force UTF-8 on both strings: URI#require_path is produced from paths whose encoding
+      # can be ASCII-8BIT (depending on how the URI was built). SQLite binds ASCII-8BIT strings
+      # as BLOB, which then compares incorrectly against TEXT-bound prefix-range parameters and
+      # silently returns zero rows. Normalizing here keeps the column's stored affinity TEXT.
+      require_path = uri.require_path
+      if require_path
+        @require_paths_buffer << [require_path.dup.force_encoding(Encoding::UTF_8), uri.to_s.dup.force_encoding(Encoding::UTF_8)]
+      end
 
       indexing_errors = listener.indexing_errors.uniq
       indexing_errors.each { |error| $stderr.puts(error) } if indexing_errors.any?
@@ -695,6 +733,10 @@ module RubyIndexer
     #: (URI::Generic uri, ?String? source) ?{ (Index index) -> void } -> void
     def handle_change(uri, source = nil, &block)
       uri_str = uri.to_s
+      # Flush first so pending buffered entries are visible in the "original" snapshot — without
+      # this, re-entry during indexing could leave original_entries missing rows that should be
+      # compared against the post-change set.
+      flush_sqlite_buffer!
       original_entries = @sqlite_store&.entries_for(uri_str)
 
       if block
@@ -705,9 +747,12 @@ module RubyIndexer
           uri,
           source, #: as !nil
         )
-        flush_sqlite_buffer!
       end
 
+      # Always flush before reading the "updated" snapshot: the block path (unsaved-change
+      # indexing) only buffers entries, and direct SQLite reads would otherwise see the
+      # mid-change state (post-delete, pre-insert) and report the URI as empty.
+      flush_sqlite_buffer!
       updated_entries = @sqlite_store&.entries_for(uri_str)
       return unless original_entries && updated_entries
 
@@ -733,69 +778,60 @@ module RubyIndexer
 
     #: -> bool
     def empty?
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       @sqlite_store.nil? || @sqlite_store.empty?
     end
 
     #: -> Array[String]
     def names
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       @sqlite_store&.names || []
     end
 
     #: (String name) -> bool
     def indexed?(name)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       @sqlite_store&.indexed?(name) || false
     end
 
     #: -> Integer
     def length
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       @sqlite_store&.length || 0
     end
 
+    # Returns a buffered SingletonClass entry that callers may freely mutate (e.g., appending
+    # mixin operations). If an entry already exists in the in-memory buffer, it is returned so
+    # that mutations within a single indexing pass coalesce. Otherwise a fresh entry is created
+    # and added to the buffer — we never materialize from SQLite, because mutations to a
+    # materialized object would not be visible at flush time and could collide with persisted
+    # rows from other URIs. Mixin operations contributed by other URIs persist in SQLite and are
+    # still aggregated when a singleton is read back (see batch_load_mixin_operations).
     #: (String name) -> Entry::SingletonClass
     def existing_or_new_singleton_class(name)
       *_namespace, unqualified_name = name.split("::")
       full_singleton_name = "#{name}::<Class:#{unqualified_name}>"
 
-      # Check the in-memory buffer first to avoid materializing a new object from SQLite,
-      # which would lose any mixin_operations added to the buffered entry
-      singleton = @sqlite_buffer.find { |e| e.is_a?(Entry::SingletonClass) && e.name == full_singleton_name } #: as Entry::SingletonClass?
+      buffered = @buffered_namespaces_by_name[full_singleton_name]
+      return buffered if buffered.is_a?(Entry::SingletonClass)
 
-      unless singleton
-        existing = self[full_singleton_name]&.first #: as Entry::SingletonClass?
+      attached_ancestor = @buffered_namespaces_by_name[name] || self[name]&.first #: as !nil
 
-        if existing
-          # Move the entry from SQLite back to the buffer so that callers can mutate it
-          # (e.g., adding mixin operations) and the changes will be persisted on the next flush
-          @sqlite_store&.delete_entry_by_name(full_singleton_name)
-          @sqlite_buffer << existing
-          singleton = existing
-        end
-      end
-
-      unless singleton
-        attached_ancestor = self[name]&.first #: as !nil
-
-        singleton = Entry::SingletonClass.new(
-          [full_singleton_name],
-          attached_ancestor.uri,
-          attached_ancestor.location,
-          attached_ancestor.name_location,
-          nil,
-          nil,
-        )
-        add(singleton, skip_prefix_tree: true)
-      end
-
+      singleton = Entry::SingletonClass.new(
+        [full_singleton_name],
+        attached_ancestor.uri,
+        attached_ancestor.location,
+        attached_ancestor.name_location,
+        nil,
+        nil,
+      )
+      add(singleton)
       singleton
     end
 
     #: [T] (String uri, ?Class[(T & Entry)]? type) -> (Array[Entry] | Array[T])?
     def entries_for(uri, type = nil)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       entries = @sqlite_store&.entries_for(uri.to_s)
       return entries unless type
 
@@ -807,8 +843,24 @@ module RubyIndexer
     # Prefix search via SQLite store
     #: (String query) -> Array[Array[Entry]]
     def combined_prefix_search(query)
-      flush_sqlite_buffer! if @sqlite_buffer.any?
+      flush_sqlite_buffer!
       @sqlite_store&.prefix_search(query) || []
+    end
+
+    # Dedup groups of entries by the group's first entry name. Needed because materialized
+    # entries are fresh objects on every query, so Array#uniq!/#== can't recognize that two
+    # groups represent the same constant when both sides are pulled from SQLite independently.
+    # Preserves first-seen order.
+    #: (Array[Array[Entry]] groups) -> Array[Array[Entry]]
+    def dedup_groups_by_name(groups)
+      seen = {} #: Hash[String, bool]
+      groups.select do |group|
+        name = group.first&.name
+        next false unless name
+        next false if seen[name]
+
+        seen[name] = true
+      end
     end
 
     # Always returns the linearized ancestors for the attached class, regardless of whether `name` refers to a singleton
@@ -992,6 +1044,7 @@ module RubyIndexer
       # With SQLite, entries are materialized as new objects on each query, so we compare by name
       # rather than object identity
       return entry if target_name == alias_name
+
       resolved_alias = Entry::ConstantAlias.new(target_name, entry)
 
       # Persist the resolved alias to SQLite so future queries find the ConstantAlias directly
@@ -1139,6 +1192,14 @@ module RubyIndexer
         target_method_entries.first, #: as !nil
         entry,
       )
+
+      # Cache the resolved alias so subsequent `index[name]` calls see MethodAlias instead of
+      # the stored UnresolvedMethodAlias. The old in-memory index used to mutate the @entries
+      # array here; we can't do that with SQLite persistence, so we maintain an overlay cache.
+      cached = (@resolved_method_aliases[new_name] ||= [])
+      cached.reject! { |a| a.owner_name == resolved_alias.owner_name }
+      cached << resolved_alias
+
       resolved_alias
     end
 
@@ -1156,11 +1217,8 @@ module RubyIndexer
     #: (?db_path: String?) -> bool
     def initialize_sqlite_store!(db_path: nil)
       unless db_path
-        db_dir = File.join(Dir.home, ".cache", "ruby-lsp", Digest::SHA1.hexdigest(@configuration.workspace_path))
-        FileUtils.mkdir_p(db_dir)
-        db_path = File.join(db_dir, "index.db")
-
-        current_hash = compute_lockfile_hash
+        db_path = SQLiteStore.db_path_for(@configuration.workspace_path)
+        current_hash = SQLiteStore.compute_lockfile_hash
 
         # Try to reuse existing DB if gems haven't changed
         if File.exist?(db_path)
@@ -1169,20 +1227,22 @@ module RubyIndexer
             stored_hash = store.get_metadata("lockfile_hash")
 
             if stored_hash == current_hash
+              @sqlite_store.close
               @sqlite_store = store
               return true
             end
 
             # Lockfile changed — drop the stale DB
             store.close
-          rescue StandardError
-            # Corrupted DB — ignore and recreate
+          rescue SQLite3::Exception => e
+            $stderr.puts("Ruby LSP> Failed to open existing index DB (#{e.class}: #{e.message}); rebuilding")
           end
 
           File.delete(db_path) if File.exist?(db_path)
         end
       end
 
+      @sqlite_store.close
       @sqlite_store = SQLiteStore.new(db_path)
       false
     end
@@ -1190,38 +1250,21 @@ module RubyIndexer
     # Compute a hash of the current gem lockfile for cache invalidation
     #: -> String
     def compute_lockfile_hash
-      lockfile_path = begin
-        Bundler.default_lockfile.to_s
-      rescue Bundler::GemfileNotFound
-        nil
-      end
-
-      content = if lockfile_path && File.exist?(lockfile_path)
-        File.read(lockfile_path)
-      else
-        # Include Ruby version as fallback for stdlib-only projects
-        RUBY_VERSION
-      end
-
-      Digest::SHA1.hexdigest(content)
+      SQLiteStore.compute_lockfile_hash
     end
 
-    # Flush the buffered gem/stdlib entries to SQLite in a single transaction
+    # Flush buffered entries and require paths to SQLite in a single transaction
     #: -> void
     def flush_sqlite_buffer!
-      return unless @sqlite_store
-      return if @sqlite_buffer.empty?
+      return if @sqlite_buffer.empty? && @require_paths_buffer.empty?
 
       entries_hash = {} #: Hash[String, Array[Entry]]
-      uris_hash = {} #: Hash[String, Array[Entry]]
+      @sqlite_buffer.each { |entry| (entries_hash[entry.name] ||= []) << entry }
 
-      @sqlite_buffer.each do |entry|
-        (entries_hash[entry.name] ||= []) << entry
-        (uris_hash[entry.uri.to_s] ||= []) << entry
-      end
-
-      @sqlite_store.bulk_insert(entries_hash, uris_hash, nil)
+      @sqlite_store.bulk_insert(entries_hash, @require_paths_buffer)
       @sqlite_buffer.clear
+      @buffered_namespaces_by_name.clear
+      @require_paths_buffer.clear
     end
   end
 end
